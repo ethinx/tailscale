@@ -522,6 +522,7 @@ func (s *Server) registerClient(c *sclient) {
 		s.clientsMesh[c.key] = nil // just for varz of total users in cluster
 	}
 	s.keyOfAddr[c.remoteIPPort] = c.key
+	fmt.Printf("client registered: %s\n", c.remoteAddr)
 	s.curClients.Add(1)
 	s.broadcastPeerStateChangeLocked(c.key, true)
 }
