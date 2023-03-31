@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package interfaces contains helpers for looking up system network interfaces.
 package interfaces
@@ -44,7 +43,8 @@ func Tailscale() ([]netip.Addr, *net.Interface, error) {
 		var tsIPs []netip.Addr
 		for _, a := range addrs {
 			if ipnet, ok := a.(*net.IPNet); ok {
-				nip, ok := netaddr.FromStdIP(ipnet.IP)
+				nip, ok := netip.AddrFromSlice(ipnet.IP)
+				nip = nip.Unmap()
 				if ok && tsaddr.IsTailscaleIP(nip) {
 					tsIPs = append(tsIPs, nip)
 				}
@@ -110,10 +110,11 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 		for _, a := range addrs {
 			switch v := a.(type) {
 			case *net.IPNet:
-				ip, ok := netaddr.FromStdIP(v.IP)
+				ip, ok := netip.AddrFromSlice(v.IP)
 				if !ok {
 					continue
 				}
+				ip = ip.Unmap()
 				// TODO(apenwarr): don't special case cgNAT.
 				// In the general wireguard case, it might
 				// very well be something we can route to
@@ -152,11 +153,9 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 	if len(regular4) == 0 && len(regular6) == 0 {
 		// if we have no usable IP addresses then be willing to accept
 		// addresses we otherwise wouldn't, like:
-		//   + 169.254.x.x (AWS Lambda uses NAT with these)
+		//   + 169.254.x.x (AWS Lambda and Azure App Services use NAT with these)
 		//   + IPv6 ULA (Google Cloud Run uses these with address translation)
-		if hostinfo.GetEnvType() == hostinfo.AWSLambda {
-			regular4 = linklocal4
-		}
+		regular4 = linklocal4
 		regular6 = ula6
 	}
 	regular = append(regular4, regular6...)
@@ -230,10 +229,6 @@ func ForeachInterface(fn func(Interface, []netip.Prefix)) error {
 // all its addresses. The IPPrefix's IP is the IP address assigned to
 // the interface, and Bits are the subnet mask.
 func (ifaces List) ForeachInterface(fn func(Interface, []netip.Prefix)) error {
-	ifaces, err := GetList()
-	if err != nil {
-		return err
-	}
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -356,6 +351,12 @@ func (s *State) String() string {
 	return sb.String()
 }
 
+// ChangeFunc is a callback function (usually registered with
+// wgengine/monitor's Mon) that's called when the network
+// changed. The changed parameter is whether the network changed
+// enough for State to have changed since the last callback.
+type ChangeFunc func(changed bool, state *State)
+
 // An InterfaceFilter indicates whether EqualFiltered should use i when deciding whether two States are equal.
 // ips are all the IPPrefixes associated with i.
 type InterfaceFilter func(i Interface, ips []netip.Prefix) bool
@@ -402,6 +403,22 @@ func (s *State) EqualFiltered(s2 *State, useInterface InterfaceFilter, useIP IPF
 	return true
 }
 
+// HasIP reports whether any interface has the provided IP address.
+func (s *State) HasIP(ip netip.Addr) bool {
+	if s == nil {
+		return false
+	}
+	want := netip.PrefixFrom(ip, ip.BitLen())
+	for _, pv := range s.InterfaceIPs {
+		for _, p := range pv {
+			if p == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func interfacesEqual(a, b Interface) bool {
 	return a.Index == b.Index &&
 		a.MTU == b.MTU &&
@@ -439,13 +456,13 @@ func prefixesEqual(a, b []netip.Prefix) bool {
 
 // UseInterestingInterfaces is an InterfaceFilter that reports whether i is an interesting interface.
 // An interesting interface if it is (a) not owned by Tailscale and (b) routes interesting IP addresses.
-// See UseInterestingIPs for the defition of an interesting IP address.
+// See UseInterestingIPs for the definition of an interesting IP address.
 func UseInterestingInterfaces(i Interface, ips []netip.Prefix) bool {
 	return !isTailscaleInterface(i.Name, ips) && anyInterestingIP(ips)
 }
 
 // UseInterestingIPs is an IPFilter that reports whether ip is an interesting IP address.
-// An IP address is interesting if it is neither a lopback not a link local unicast IP address.
+// An IP address is interesting if it is neither a loopback nor a link local unicast IP address.
 func UseInterestingIPs(ip netip.Addr) bool {
 	return isInterestingIP(ip)
 }
@@ -453,7 +470,7 @@ func UseInterestingIPs(ip netip.Addr) bool {
 // UseAllInterfaces is an InterfaceFilter that includes all interfaces.
 func UseAllInterfaces(i Interface, ips []netip.Prefix) bool { return true }
 
-// UseAllIPs is an IPFilter that includes all all IPs.
+// UseAllIPs is an IPFilter that includes all IPs.
 func UseAllIPs(ips netip.Addr) bool { return true }
 
 func (s *State) HasPAC() bool { return s != nil && s.PAC != "" }
@@ -594,8 +611,18 @@ func LikelyHomeRouterIP() (gateway, myIP netip.Addr, ok bool) {
 		return
 	}
 	ForeachInterfaceAddress(func(i Interface, pfx netip.Prefix) {
+		if !i.IsUp() {
+			// Skip interfaces that aren't up.
+			return
+		} else if myIP.IsValid() {
+			// We already have a valid self IP; skip this one.
+			return
+		}
+
 		ip := pfx.Addr()
-		if !i.IsUp() || !ip.IsValid() || myIP.IsValid() {
+		if !ip.IsValid() || !ip.Is4() {
+			// Skip IPs that aren't valid or aren't IPv4, since we
+			// always return an IPv4 address.
 			return
 		}
 		if gateway.IsPrivate() && ip.IsPrivate() {
@@ -616,7 +643,14 @@ func isUsableV4(ip netip.Addr) bool {
 		return false
 	}
 	if ip.IsLinkLocalUnicast() {
-		return hostinfo.GetEnvType() == hostinfo.AWSLambda
+		switch hostinfo.GetEnvType() {
+		case hostinfo.AWSLambda:
+			return true
+		case hostinfo.AzureAppService:
+			return true
+		default:
+			return false
+		}
 	}
 	return true
 }
@@ -742,4 +776,16 @@ func HasCGNATInterface() (bool, error) {
 		return false, err
 	}
 	return hasCGNATInterface, nil
+}
+
+var interfaceDebugExtras func(ifIndex int) (string, error)
+
+// InterfaceDebugExtras returns extra debugging information about an interface
+// if any (an empty string will be returned if there are no additional details).
+// Formatting is platform-dependent and should not be parsed.
+func InterfaceDebugExtras(ifIndex int) (string, error) {
+	if interfaceDebugExtras != nil {
+		return interfaceDebugExtras(ifIndex)
+	}
+	return "", nil
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package paths
 
@@ -18,12 +17,15 @@ import (
 // Owner: The user for the current process;
 // Primary Group: The primary group for the current process;
 // DACL: Full control to the current user and to the Administrators group.
-//       (We include Administrators so that admin users may still access logs;
-//        granting access exclusively to LocalSystem would require admins to use
-//        special tools to access the Log directory)
+//
+//	(We include Administrators so that admin users may still access logs;
+//	 granting access exclusively to LocalSystem would require admins to use
+//	 special tools to access the Log directory)
+//
 // Inheritance: The directory does not inherit the ACL from its parent.
-//              However, any directories and/or files created within this
-//              directory *do* inherit the ACL that we are setting.
+//
+//	However, any directories and/or files created within this
+//	directory *do* inherit the ACL that we are setting.
 func ensureStateDirPerms(dirPath string) error {
 	fi, err := os.Stat(dirPath)
 	if err != nil {

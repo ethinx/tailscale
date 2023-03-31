@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -16,14 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/exp/slices"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
-	"tailscale.com/net/packet"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
-	"tailscale.com/net/tstun"
 	"tailscale.com/types/dnstype"
-	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
@@ -31,28 +27,12 @@ import (
 )
 
 var (
-	magicDNSIP   = tsaddr.TailscaleServiceIP()
-	magicDNSIPv6 = tsaddr.TailscaleServiceIPv6()
-)
-
-var (
 	errFullQueue = errors.New("request queue full")
 )
 
-// maxActiveQueries returns the maximal number of DNS requests that be
-// can running.
-// If EnqueueRequest is called when this many requests are already pending,
-// the request will be dropped to avoid blocking the caller.
-func maxActiveQueries() int32 {
-	if runtime.GOOS == "ios" {
-		// For memory paranoia reasons on iOS, match the
-		// historical Tailscale 1.x..1.8 behavior for now
-		// (just before the 1.10 release).
-		return 64
-	}
-	// But for other platforms, allow more burstiness:
-	return 256
-}
+// maxActiveQueries returns the maximal number of DNS requests that can
+// be running.
+const maxActiveQueries = 256
 
 // We use file-ignore below instead of ignore because on some platforms,
 // the lint exception is necessary and on others it is not,
@@ -74,13 +54,6 @@ type response struct {
 type Manager struct {
 	logf logger.Logf
 
-	// When netstack is not used, Manager implements magic DNS.
-	// In this case, responses tracks completed DNS requests
-	// which need a response, and NextPacket() synthesizes a
-	// fake IP+UDP header to finish assembling the response.
-	//
-	// TODO(tom): Rip out once all platforms use netstack.
-	responses           chan response
 	activeQueriesAtomic int32
 
 	ctx       context.Context    // good until Down
@@ -97,10 +70,9 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, linkMon *monitor.Mon, di
 	}
 	logf = logger.WithPrefix(logf, "dns: ")
 	m := &Manager{
-		logf:      logf,
-		resolver:  resolver.New(logf, linkMon, linkSel, dialer),
-		os:        oscfg,
-		responses: make(chan response),
+		logf:     logf,
+		resolver: resolver.New(logf, linkMon, linkSel, dialer),
+		os:       oscfg,
 	}
 	m.ctx, m.ctxCancel = context.WithCancel(context.Background())
 	m.logf("using %T", m.os)
@@ -137,6 +109,47 @@ func (m *Manager) Set(cfg Config) error {
 	return nil
 }
 
+// compileHostEntries creates a list of single-label resolutions possible
+// from the configured hosts and search domains.
+// The entries are compiled in the order of the search domains, then the hosts.
+// The returned list is sorted by the first hostname in each entry.
+func compileHostEntries(cfg Config) (hosts []*HostEntry) {
+	didLabel := make(map[string]bool, len(cfg.Hosts))
+	for _, sd := range cfg.SearchDomains {
+		for h, ips := range cfg.Hosts {
+			if !sd.Contains(h) || h.NumLabels() != (sd.NumLabels()+1) {
+				continue
+			}
+			ipHosts := []string{string(h.WithTrailingDot())}
+			if label := dnsname.FirstLabel(string(h)); !didLabel[label] {
+				didLabel[label] = true
+				ipHosts = append(ipHosts, label)
+			}
+			for _, ip := range ips {
+				if cfg.OnlyIPv6 && ip.Is4() {
+					continue
+				}
+				hosts = append(hosts, &HostEntry{
+					Addr:  ip,
+					Hosts: ipHosts,
+				})
+				// Only add IPv4 or IPv6 per host, like we do in the resolver.
+				break
+			}
+		}
+	}
+	slices.SortFunc(hosts, func(a, b *HostEntry) bool {
+		if len(a.Hosts) == 0 {
+			return false
+		}
+		if len(b.Hosts) == 0 {
+			return true
+		}
+		return a.Hosts[0] < b.Hosts[0]
+	})
+	return hosts
+}
+
 // compileConfig converts cfg into a quad-100 resolver configuration
 // and an OS-level configuration.
 func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig, err error) {
@@ -152,8 +165,12 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 			routes[suffix] = resolvers
 		}
 	}
+
 	// Similarly, the OS always gets search paths.
 	ocfg.SearchDomains = cfg.SearchDomains
+	if runtime.GOOS == "windows" {
+		ocfg.Hosts = compileHostEntries(cfg)
+	}
 
 	// Deal with trivial configs first.
 	switch {
@@ -162,9 +179,14 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		// case where cfg is entirely zero, in which case these
 		// configs clear all Tailscale DNS settings.
 		return rcfg, ocfg, nil
-	case cfg.hasDefaultIPResolversOnly():
-		// Trivial CorpDNS configuration, just override the OS
-		// resolver.
+	case cfg.hasDefaultIPResolversOnly() && !cfg.hasHostsWithoutSplitDNSRoutes():
+		// Trivial CorpDNS configuration, just override the OS resolver.
+		//
+		// If there are hosts (ExtraRecords) that are not covered by an existing
+		// SplitDNS route, then we don't go into this path so that we fall into
+		// the next case and send the extra record hosts queries through
+		// 100.100.100.100 instead where we can answer them.
+		//
 		// TODO: for OSes that support it, pass IP:port and DoH
 		// addresses directly to OS.
 		// https://github.com/tailscale/tailscale/issues/1666
@@ -214,23 +236,40 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	rcfg.Routes = routes
 	ocfg.Nameservers = []netip.Addr{cfg.serviceIP()}
 
-	// If the OS can't do native split-dns, read out the underlying
-	// resolver config and blend it into our config.
-	if m.os.SupportsSplitDNS() {
-		ocfg.MatchDomains = cfg.matchDomains()
-	}
-	if !m.os.SupportsSplitDNS() || isWindows {
-		bcfg, err := m.os.GetBaseConfig()
-		if err != nil {
+	var baseCfg *OSConfig // base config; non-nil if/when known
+
+	// Even though Apple devices can do split DNS, they don't provide a way to
+	// selectively answer ExtraRecords, and ignore other DNS traffic. As a
+	// workaround, we read the existing default resolver configuration and use
+	// that as the forwarder for all DNS traffic that quad-100 doesn't handle.
+	const isApple = runtime.GOOS == "darwin" || runtime.GOOS == "ios"
+
+	if isApple || !m.os.SupportsSplitDNS() {
+		// If the OS can't do native split-dns, read out the underlying
+		// resolver config and blend it into our config.
+		cfg, err := m.os.GetBaseConfig()
+		if err == nil {
+			baseCfg = &cfg
+		} else if isApple && err == ErrGetBaseConfigNotSupported {
+			// This is currently (2022-10-13) expected on certain iOS and macOS
+			// builds.
+		} else {
 			health.SetDNSOSHealth(err)
 			return resolver.Config{}, OSConfig{}, err
 		}
+	}
+
+	if baseCfg == nil || isApple && len(baseCfg.Nameservers) == 0 {
+		// If there was no base config, or if we're on Apple and the base
+		// config is empty, then we need to fallback to SplitDNS mode.
+		ocfg.MatchDomains = cfg.matchDomains()
+	} else {
 		var defaultRoutes []*dnstype.Resolver
-		for _, ip := range bcfg.Nameservers {
+		for _, ip := range baseCfg.Nameservers {
 			defaultRoutes = append(defaultRoutes, &dnstype.Resolver{Addr: ip.String()})
 		}
 		rcfg.Routes["."] = defaultRoutes
-		ocfg.SearchDomains = append(ocfg.SearchDomains, bcfg.SearchDomains...)
+		ocfg.SearchDomains = append(ocfg.SearchDomains, baseCfg.SearchDomains...)
 	}
 
 	return rcfg, ocfg, nil
@@ -248,90 +287,7 @@ func toIPsOnly(resolvers []*dnstype.Resolver) (ret []netip.Addr) {
 	return ret
 }
 
-// EnqueuePacket is the legacy path for handling magic DNS traffic, and is
-// called with a DNS request payload.
-//
-// TODO(tom): Rip out once all platforms use netstack.
-func (m *Manager) EnqueuePacket(bs []byte, proto ipproto.Proto, from, to netip.AddrPort) error {
-	if to.Port() != 53 || proto != ipproto.UDP {
-		return nil
-	}
-
-	if n := atomic.AddInt32(&m.activeQueriesAtomic, 1); n > maxActiveQueries() {
-		atomic.AddInt32(&m.activeQueriesAtomic, -1)
-		metricDNSQueryErrorQueue.Add(1)
-		return errFullQueue
-	}
-
-	go func() {
-		resp, err := m.resolver.Query(m.ctx, bs, from)
-		if err != nil {
-			atomic.AddInt32(&m.activeQueriesAtomic, -1)
-			m.logf("dns query: %v", err)
-			return
-		}
-
-		select {
-		case <-m.ctx.Done():
-			return
-		case m.responses <- response{resp, from}:
-		}
-	}()
-	return nil
-}
-
-// NextPacket is the legacy path for obtaining DNS results in response to
-// magic DNS queries. It blocks until a response is available.
-//
-// TODO(tom): Rip out once all platforms use netstack.
-func (m *Manager) NextPacket() ([]byte, error) {
-	var resp response
-	select {
-	case <-m.ctx.Done():
-		return nil, net.ErrClosed
-	case resp = <-m.responses:
-		// continue
-	}
-
-	// Unused space is needed further down the stack. To avoid extra
-	// allocations/copying later on, we allocate such space here.
-	const offset = tstun.PacketStartOffset
-
-	var buf []byte
-	switch {
-	case resp.to.Addr().Is4():
-		h := packet.UDP4Header{
-			IP4Header: packet.IP4Header{
-				Src: magicDNSIP,
-				Dst: resp.to.Addr(),
-			},
-			SrcPort: 53,
-			DstPort: resp.to.Port(),
-		}
-		hlen := h.Len()
-		buf = make([]byte, offset+hlen+len(resp.pkt))
-		copy(buf[offset+hlen:], resp.pkt)
-		h.Marshal(buf[offset:])
-	case resp.to.Addr().Is6():
-		h := packet.UDP6Header{
-			IP6Header: packet.IP6Header{
-				Src: magicDNSIPv6,
-				Dst: resp.to.Addr(),
-			},
-			SrcPort: 53,
-			DstPort: resp.to.Port(),
-		}
-		hlen := h.Len()
-		buf = make([]byte, offset+hlen+len(resp.pkt))
-		copy(buf[offset+hlen:], resp.pkt)
-		h.Marshal(buf[offset:])
-	}
-
-	atomic.AddInt32(&m.activeQueriesAtomic, -1)
-	return buf, nil
-}
-
-// Query executes a DNS query recieved from the given address. The query is
+// Query executes a DNS query received from the given address. The query is
 // provided in bs as a wire-encoded DNS query without any transport header.
 // This method is called for requests arriving over UDP and TCP.
 func (m *Manager) Query(ctx context.Context, bs []byte, from netip.AddrPort) ([]byte, error) {
@@ -342,7 +298,7 @@ func (m *Manager) Query(ctx context.Context, bs []byte, from netip.AddrPort) ([]
 		// continue
 	}
 
-	if n := atomic.AddInt32(&m.activeQueriesAtomic, 1); n > maxActiveQueries() {
+	if n := atomic.AddInt32(&m.activeQueriesAtomic, 1); n > maxActiveQueries {
 		atomic.AddInt32(&m.activeQueriesAtomic, -1)
 		metricDNSQueryErrorQueue.Add(1)
 		return nil, errFullQueue
@@ -359,8 +315,8 @@ const (
 	// The RFCs don't specify the max size of a TCP-based DNS query,
 	// but we want to keep this reasonable. Given payloads are typically
 	// much larger and all known client send a single query, I've arbitrarily
-	// chosen 2k.
-	maxReqSizeTCP = 2048
+	// chosen 4k.
+	maxReqSizeTCP = 4096
 )
 
 // dnsTCPSession services DNS requests sent over TCP.
@@ -379,8 +335,16 @@ type dnsTCPSession struct {
 
 func (s *dnsTCPSession) handleWrites() {
 	defer s.conn.Close()
-	defer close(s.responses)
 	defer s.closeCtx()
+
+	// NOTE(andrew): we explicitly do not close the 'responses' channel
+	// when this function exits. If we hit an error and return, we could
+	// still have outstanding 'handleQuery' goroutines running, and if we
+	// closed this channel they'd end up trying to send on a closed channel
+	// when they finish.
+	//
+	// Because we call closeCtx, those goroutines will not hang since they
+	// select on <-s.ctx.Done() as well as s.responses.
 
 	for {
 		select {
@@ -408,6 +372,7 @@ func (s *dnsTCPSession) handleQuery(q []byte) {
 		return
 	}
 
+	// See note in handleWrites (above) regarding this select{}
 	select {
 	case <-s.ctx.Done():
 	case s.responses <- resp:
@@ -415,6 +380,7 @@ func (s *dnsTCPSession) handleQuery(q []byte) {
 }
 
 func (s *dnsTCPSession) handleReads() {
+	defer s.conn.Close()
 	defer close(s.readClosing)
 
 	for {
@@ -447,6 +413,11 @@ func (s *dnsTCPSession) handleReads() {
 			case <-s.ctx.Done():
 				return
 			default:
+				// NOTE: by kicking off the query handling in a
+				// new goroutine, it is possible that we'll
+				// deliver responses out-of-order. This is
+				// explicitly allowed by RFC7766, Section
+				// 6.2.1.1 ("Query Pipelining").
 				go s.handleQuery(buf)
 			}
 		}
@@ -490,7 +461,7 @@ func Cleanup(logf logger.Logf, interfaceName string) {
 		logf("creating dns cleanup: %v", err)
 		return
 	}
-	dns := NewManager(logf, oscfg, nil, new(tsdial.Dialer), nil)
+	dns := NewManager(logf, oscfg, nil, &tsdial.Dialer{Logf: logf}, nil)
 	if err := dns.Down(); err != nil {
 		logf("dns down: %v", err)
 	}

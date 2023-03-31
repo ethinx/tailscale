@@ -1,17 +1,17 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !js
-// +build !js
 
 package wgengine
 
 import (
+	"fmt"
 	"log"
 	"net/netip"
 	"runtime/pprof"
 	"strings"
+	"sync"
 	"time"
 
 	"tailscale.com/envknob"
@@ -22,6 +22,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/monitor"
@@ -38,11 +39,17 @@ func NewWatchdog(e Engine) Engine {
 		return e
 	}
 	return &watchdogEngine{
-		wrap:    e,
-		logf:    log.Printf,
-		fatalf:  log.Fatalf,
-		maxWait: 45 * time.Second,
+		wrap:     e,
+		logf:     log.Printf,
+		fatalf:   log.Fatalf,
+		maxWait:  45 * time.Second,
+		inFlight: make(map[inFlightKey]time.Time),
 	}
+}
+
+type inFlightKey struct {
+	op  string
+	ctr uint64
 }
 
 type watchdogEngine struct {
@@ -50,9 +57,31 @@ type watchdogEngine struct {
 	logf    func(format string, args ...any)
 	fatalf  func(format string, args ...any)
 	maxWait time.Duration
+
+	// Track the start time(s) of in-flight operations
+	inFlightMu  sync.Mutex
+	inFlight    map[inFlightKey]time.Time
+	inFlightCtr uint64
 }
 
 func (e *watchdogEngine) watchdogErr(name string, fn func() error) error {
+	// Track all in-flight operations so we can print more useful error
+	// messages on watchdog failure
+	e.inFlightMu.Lock()
+	key := inFlightKey{
+		op:  name,
+		ctr: e.inFlightCtr,
+	}
+	e.inFlightCtr++
+	e.inFlight[key] = time.Now()
+	e.inFlightMu.Unlock()
+
+	defer func() {
+		e.inFlightMu.Lock()
+		defer e.inFlightMu.Unlock()
+		delete(e.inFlight, key)
+	}()
+
 	errCh := make(chan error)
 	go func() {
 		errCh <- fn()
@@ -66,6 +95,22 @@ func (e *watchdogEngine) watchdogErr(name string, fn func() error) error {
 		buf := new(strings.Builder)
 		pprof.Lookup("goroutine").WriteTo(buf, 1)
 		e.logf("wgengine watchdog stacks:\n%s", buf.String())
+
+		// Collect the list of in-flight operations for debugging.
+		var (
+			b   []byte
+			now = time.Now()
+		)
+		e.inFlightMu.Lock()
+		for k, t := range e.inFlight {
+			dur := now.Sub(t).Round(time.Millisecond)
+			b = fmt.Appendf(b, "in-flight[%d]: name=%s duration=%v start=%s\n", k.ctr, k.op, dur, t.Format(time.RFC3339Nano))
+		}
+		e.inFlightMu.Unlock()
+
+		// Print everything as a single string to avoid log
+		// rate limits.
+		e.logf("wgengine watchdog in-flight:\n%s", b)
 		e.fatalf("wgengine: watchdog timeout on %s", name)
 		return nil
 	}
@@ -155,4 +200,8 @@ func (e *watchdogEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 
 func (e *watchdogEngine) Wait() {
 	e.wrap.Wait()
+}
+
+func (e *watchdogEngine) InstallCaptureHook(cb capture.Callback) {
+	e.wrap.InstallCaptureHook(cb)
 }

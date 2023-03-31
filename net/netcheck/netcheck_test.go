@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package netcheck
 
@@ -9,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
 )
 
 func TestHairpinSTUN(t *testing.T) {
@@ -43,6 +45,113 @@ func TestHairpinSTUN(t *testing.T) {
 	default:
 		t.Fatal("expected value")
 	}
+}
+
+func TestHairpinWait(t *testing.T) {
+	makeClient := func(t *testing.T) (*Client, *reportState) {
+		tx := stun.NewTxID()
+		c := &Client{}
+		req := stun.Request(tx)
+		if !stun.Is(req) {
+			t.Fatal("expected STUN message")
+		}
+
+		var err error
+		rs := &reportState{
+			c:           c,
+			hairTX:      tx,
+			gotHairSTUN: make(chan netip.AddrPort, 1),
+			hairTimeout: make(chan struct{}),
+			report:      newReport(),
+		}
+		rs.pc4Hair, err = net.ListenUDP("udp4", &net.UDPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		c.curState = rs
+		return c, rs
+	}
+
+	ll, err := net.ListenPacket("udp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ll.Close()
+	dstAddr := netip.MustParseAddrPort(ll.LocalAddr().String())
+
+	t.Run("Success", func(t *testing.T) {
+		c, rs := makeClient(t)
+		req := stun.Request(rs.hairTX)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		// Fake receiving the stun check from ourselves after some period of time.
+		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
+		c.handleHairSTUNLocked(req, src)
+
+		rs.waitHairCheck(context.Background())
+
+		// Verify that we set HairPinning
+		if got := rs.report.HairPinning; !got.EqualBool(true) {
+			t.Errorf("wanted HairPinning=true, got %v", got)
+		}
+	})
+
+	t.Run("LateReply", func(t *testing.T) {
+		c, rs := makeClient(t)
+		req := stun.Request(rs.hairTX)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		// Wait until we've timed out, to mimic the race in #1795.
+		<-rs.hairTimeout
+
+		// Fake receiving the stun check from ourselves after some period of time.
+		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
+		c.handleHairSTUNLocked(req, src)
+
+		// Wait for a hairpin response
+		rs.waitHairCheck(context.Background())
+
+		// Verify that we set HairPinning
+		if got := rs.report.HairPinning; !got.EqualBool(true) {
+			t.Errorf("wanted HairPinning=true, got %v", got)
+		}
+	})
+
+	t.Run("Timeout", func(t *testing.T) {
+		_, rs := makeClient(t)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		ctx, cancel := context.WithTimeout(context.Background(), hairpinCheckTimeout*50)
+		defer cancel()
+
+		// Wait in the background
+		waitDone := make(chan struct{})
+		go func() {
+			rs.waitHairCheck(ctx)
+			close(waitDone)
+		}()
+
+		// If we do nothing, then we time out; confirm that we set
+		// HairPinning to false in this case.
+		select {
+		case <-waitDone:
+			if got := rs.report.HairPinning; !got.EqualBool(false) {
+				t.Errorf("wanted HairPinning=false, got %v", got)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for hairpin channel")
+		}
+	})
 }
 
 func TestBasic(t *testing.T) {
@@ -114,6 +223,9 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	// OS IPv6 test is irrelevant here, accept whatever the current
 	// machine has.
 	want.OSHasIPv6 = r.OSHasIPv6
+	// Captive portal test is irrelevant; accept what the current report
+	// has.
+	want.CaptivePortal = r.CaptivePortal
 
 	if !reflect.DeepEqual(r, want) {
 		t.Errorf("mismatch\n got: %+v\nwant: %+v\n", r, want)
@@ -524,7 +636,12 @@ func TestLogConciseReport(t *testing.T) {
 		{
 			name: "no_udp",
 			r:    &Report{},
-			want: "udp=false v4=false v6=false mapvarydest= hair= portmap=? derp=0",
+			want: "udp=false v4=false icmpv4=false v6=false mapvarydest= hair= portmap=? derp=0",
+		},
+		{
+			name: "no_udp_icmp",
+			r:    &Report{ICMPv4: true, IPv4: true},
+			want: "udp=false icmpv4=true v6=false mapvarydest= hair= portmap=? derp=0",
 		},
 		{
 			name: "ipv4_one_region",
@@ -611,7 +728,7 @@ func TestLogConciseReport(t *testing.T) {
 			var buf bytes.Buffer
 			c := &Client{Logf: func(f string, a ...any) { fmt.Fprintf(&buf, f, a...) }}
 			c.logConciseReport(tt.r, dm)
-			if got := strings.TrimPrefix(buf.String(), "[v1] report: "); got != tt.want {
+			if got, ok := strings.CutPrefix(buf.String(), "[v1] report: "); !ok {
 				t.Errorf("unexpected result.\n got: %#q\nwant: %#q\n", got, tt.want)
 			}
 		})
@@ -654,4 +771,56 @@ func TestSortRegions(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v; want %v", got, want)
 	}
+}
+
+func TestNoCaptivePortalWhenUDP(t *testing.T) {
+	// Override noRedirectClient to handle the /generate_204 endpoint
+	var generate204Called atomic.Bool
+	tr := RoundTripFunc(func(req *http.Request) *http.Response {
+		if !strings.HasSuffix(req.URL.String(), "/generate_204") {
+			panic("bad URL: " + req.URL.String())
+		}
+		generate204Called.Store(true)
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+		}
+	})
+
+	tstest.Replace(t, &noRedirectClient.Transport, http.RoundTripper(tr))
+
+	stunAddr, cleanup := stuntest.Serve(t)
+	defer cleanup()
+
+	c := &Client{
+		Logf:              t.Logf,
+		UDPBindAddr:       "127.0.0.1:0",
+		testEnoughRegions: 1,
+
+		// Set the delay long enough that we have time to cancel it
+		// when our STUN probe succeeds.
+		testCaptivePortalDelay: 10 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not have called our captive portal function.
+	if generate204Called.Load() {
+		t.Errorf("captive portal check called; expected no call")
+	}
+	if r.CaptivePortal != "" {
+		t.Errorf("got CaptivePortal=%q, want empty", r.CaptivePortal)
+	}
+}
+
+type RoundTripFunc func(req *http.Request) *http.Response
+
+func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req), nil
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -12,21 +11,21 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"tailscale.com/net/netaddr"
-	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 )
 
-// TestIGD is an IGD (Intenet Gateway Device) for testing. It supports fake
+// TestIGD is an IGD (Internet Gateway Device) for testing. It supports fake
 // implementations of NAT-PMP, PCP, and/or UPnP to test clients against.
 type TestIGD struct {
 	upnpConn net.PacketConn // for UPnP discovery
 	pxpConn  net.PacketConn // for NAT-PMP and/or PCP
 	ts       *httptest.Server
 	logf     logger.Logf
-	closed   syncs.AtomicBool
+	closed   atomic.Bool
 
 	// do* will log which packets are sent, but will not reply to unexpected packets.
 
@@ -71,7 +70,7 @@ func NewTestIGD(logf logger.Logf, t TestIGDOptions) (*TestIGD, error) {
 	d.logf = func(msg string, args ...any) {
 		// Don't log after the device has closed;
 		// stray trailing logging angers testing.T.Logf.
-		if d.closed.Get() {
+		if d.closed.Load() {
 			return
 		}
 		logf(msg, args...)
@@ -107,7 +106,7 @@ func testIPAndGateway() (gw, ip netip.Addr, ok bool) {
 }
 
 func (d *TestIGD) Close() error {
-	d.closed.Set(true)
+	d.closed.Store(true)
 	d.ts.Close()
 	d.upnpConn.Close()
 	d.pxpConn.Close()
@@ -135,7 +134,7 @@ func (d *TestIGD) serveUPnPDiscovery() {
 	for {
 		n, src, err := d.upnpConn.ReadFrom(buf)
 		if err != nil {
-			if !d.closed.Get() {
+			if !d.closed.Load() {
 				d.logf("serveUPnP failed: %v", err)
 			}
 			return
@@ -143,7 +142,7 @@ func (d *TestIGD) serveUPnPDiscovery() {
 		pkt := buf[:n]
 		if bytes.Equal(pkt, uPnPPacket) { // a super lazy "parse"
 			d.inc(&d.counters.numUPnPDiscoRecv)
-			resPkt := []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nEXT:\r\nSERVER: Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1\r\nLOCATION: %s\r\nOPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n01-NLS: 1627958564\r\nBOOTID.UPNP.ORG: 1627958564\r\nCONFIGID.UPNP.ORG: 1337\r\n\r\n", d.ts.URL+"/rootDesc.xml"))
+			resPkt := fmt.Appendf(nil, "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nEXT:\r\nSERVER: Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1\r\nLOCATION: %s\r\nOPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n01-NLS: 1627958564\r\nBOOTID.UPNP.ORG: 1627958564\r\nCONFIGID.UPNP.ORG: 1337\r\n\r\n", d.ts.URL+"/rootDesc.xml")
 			if d.doUPnP {
 				_, err = d.upnpConn.WriteTo(resPkt, src)
 				if err != nil {
@@ -162,14 +161,13 @@ func (d *TestIGD) servePxP() {
 	for {
 		n, a, err := d.pxpConn.ReadFrom(buf)
 		if err != nil {
-			if !d.closed.Get() {
+			if !d.closed.Load() {
 				d.logf("servePxP failed: %v", err)
 			}
 			return
 		}
-		ua := a.(*net.UDPAddr)
-		src, ok := netaddr.FromStdAddr(ua.IP, ua.Port, ua.Zone)
-		if !ok {
+		src := netaddr.Unmap(a.(*net.UDPAddr).AddrPort())
+		if !src.IsValid() {
 			panic("bogus addr")
 		}
 		pkt := buf[:n]
@@ -214,7 +212,7 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 	op := pkt[1]
 	pktSrcBytes := [16]byte{}
 	copy(pktSrcBytes[:], pkt[8:24])
-	pktSrc := netaddr.IPFrom16(pktSrcBytes)
+	pktSrc := netip.AddrFrom16(pktSrcBytes).Unmap()
 	if pktSrc != src.Addr() {
 		// TODO this error isn't fatal but should be rejected by server.
 		// Since it's a test it's difficult to get them the same though.
@@ -251,7 +249,7 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 
 func newTestClient(t *testing.T, igd *TestIGD) *Client {
 	var c *Client
-	c = NewClient(t.Logf, func() {
+	c = NewClient(t.Logf, nil, func() {
 		t.Logf("port map changed")
 		t.Logf("have mapping: %v", c.HaveMapping())
 	})

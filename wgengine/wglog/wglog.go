@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package wglog contains logging helpers for wireguard-go.
 package wglog
@@ -9,9 +8,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 
-	"golang.zx2c4.com/wireguard/device"
+	"github.com/tailscale/wireguard-go/device"
+	"tailscale.com/syncs"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/wgcfg"
@@ -21,7 +20,7 @@ import (
 // It can be modified at run time to adjust to new wireguard-go configurations.
 type Logger struct {
 	DeviceLogger *device.Logger
-	replace      atomic.Value                 // of map[string]string
+	replace      syncs.AtomicValue[map[string]string]
 	mu           sync.Mutex                   // protects strs
 	strs         map[key.NodePublic]*strCache // cached strs used to populate replace
 }
@@ -36,6 +35,7 @@ type strCache struct {
 // This logger silences repetitive/unhelpful noisy log lines
 // and rewrites peer keys from wireguard-go into Tailscale format.
 func NewLogger(logf logger.Logf) *Logger {
+	const prefix = "wg: "
 	ret := new(Logger)
 	wrapper := func(format string, args ...any) {
 		if strings.Contains(format, "Routine:") && !strings.Contains(format, "receive incoming") {
@@ -52,7 +52,7 @@ func NewLogger(logf logger.Logf) *Logger {
 			// See https://github.com/tailscale/tailscale/issues/1388.
 			return
 		}
-		replace, _ := ret.replace.Load().(map[string]string)
+		replace := ret.replace.Load()
 		if replace == nil {
 			// No replacements specified; log as originally planned.
 			logf(format, args...)
@@ -81,8 +81,8 @@ func NewLogger(logf logger.Logf) *Logger {
 		logf(format, newargs...)
 	}
 	ret.DeviceLogger = &device.Logger{
-		Verbosef: logger.WithPrefix(wrapper, "[v2] "),
-		Errorf:   wrapper,
+		Verbosef: logger.WithPrefix(wrapper, prefix+"[v2] "),
+		Errorf:   logger.WithPrefix(wrapper, prefix),
 	}
 	ret.strs = make(map[key.NodePublic]*strCache)
 	return ret

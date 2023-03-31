@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package opt defines optional types.
 package opt
@@ -10,9 +9,13 @@ import (
 	"strconv"
 )
 
-// Bool represents an optional boolean to be JSON-encoded.
-// The string can be empty (for unknown or unspecified), or
-// "true" or "false".
+// Bool represents an optional boolean to be JSON-encoded.  The string
+// is either "true", "false", or the empty string to mean unset.
+//
+// As a special case, the underlying string may also be the string
+// "unset" as as a synonym for the empty string. This lets the
+// explicit unset value be exchanged over an encoding/json "omitempty"
+// field without it being dropped.
 type Bool string
 
 func (b *Bool) Set(v bool) {
@@ -22,11 +25,14 @@ func (b *Bool) Set(v bool) {
 func (b *Bool) Clear() { *b = "" }
 
 func (b Bool) Get() (v bool, ok bool) {
-	if b == "" {
-		return
+	switch b {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
 	}
-	v, err := strconv.ParseBool(string(b))
-	return v, err == nil
 }
 
 // Scan implements database/sql.Scanner.
@@ -74,7 +80,7 @@ func (b Bool) MarshalJSON() ([]byte, error) {
 		return trueBytes, nil
 	case "false":
 		return falseBytes, nil
-	case "":
+	case "", "unset":
 		return nullBytes, nil
 	}
 	return nil, fmt.Errorf("invalid opt.Bool value %q", string(b))
@@ -94,7 +100,7 @@ func (b *Bool) UnmarshalJSON(j []byte) error {
 		return nil
 	}
 	if string(j) == "null" {
-		*b = ""
+		*b = "unset"
 		return nil
 	}
 	return fmt.Errorf("invalid opt.Bool value %q", j)

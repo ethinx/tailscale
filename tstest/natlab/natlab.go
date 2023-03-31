@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package natlab lets us simulate different types of networks all
 // in-memory without running VMs or requiring root, etc. Despite the
@@ -50,7 +49,7 @@ func (p *Packet) Clone() *Packet {
 	return &Packet{
 		Src:     p.Src,
 		Dst:     p.Dst,
-		Payload: append([]byte(nil), p.Payload...),
+		Payload: bytes.Clone(p.Payload),
 		locator: p.locator,
 	}
 }
@@ -92,7 +91,7 @@ func mustPrefix(s string) netip.Prefix {
 func NewInternet() *Network {
 	return &Network{
 		Name: "internet",
-		// easily recognizable internett-y addresses
+		// easily recognizable internetty addresses
 		Prefix4: mustPrefix("1.0.0.0/24"),
 		Prefix6: mustPrefix("1111::/64"),
 	}
@@ -140,7 +139,7 @@ func (n *Network) allocIPv4(iface *Interface) netip.Addr {
 	}
 	a := n.lastV4.As16()
 	addOne(&a, 15)
-	n.lastV4 = netaddr.IPFrom16(a)
+	n.lastV4 = netip.AddrFrom16(a).Unmap()
 	if !n.Prefix4.Contains(n.lastV4) {
 		panic("pool exhausted")
 	}
@@ -159,7 +158,7 @@ func (n *Network) allocIPv6(iface *Interface) netip.Addr {
 	}
 	a := n.lastV6.As16()
 	addOne(&a, 15)
-	n.lastV6 = netaddr.IPFrom16(a)
+	n.lastV6 = netip.AddrFrom16(a).Unmap()
 	if !n.Prefix6.Contains(n.lastV6) {
 		panic("pool exhausted")
 	}
@@ -243,7 +242,7 @@ func (f *Interface) String() string {
 	if f.name != "" {
 		return f.name
 	}
-	return fmt.Sprintf("unamed-interface-on-network-%p", f.net)
+	return fmt.Sprintf("unnamed-interface-on-network-%p", f.net)
 }
 
 // Contains reports whether f contains ip as an IP.
@@ -812,6 +811,18 @@ func (c *conn) LocalAddr() net.Addr {
 	}
 }
 
+func (c *conn) Read(buf []byte) (int, error) {
+	panic("unimplemented stub")
+}
+
+func (c *conn) RemoteAddr() net.Addr {
+	panic("unimplemented stub")
+}
+
+func (c *conn) Write(buf []byte) (int, error) {
+	panic("unimplemented stub")
+}
+
 func (c *conn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -852,7 +863,7 @@ func (c *conn) WriteToUDPAddrPort(p []byte, ipp netip.AddrPort) (n int, err erro
 	pkt := &Packet{
 		Src:     c.ipp,
 		Dst:     ipp,
-		Payload: append([]byte(nil), p...),
+		Payload: bytes.Clone(p),
 	}
 	pkt.setLocator("mach=%s", c.m.Name)
 	pkt.Trace("PacketConn.WriteTo")

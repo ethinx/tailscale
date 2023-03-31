@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
@@ -18,7 +17,7 @@ import (
 const unknown = ipproto.Unknown
 
 // RFC1858: prevent overlapping fragment attacks.
-const minFrag = 60 + 20 // max IPv4 header + basic TCP header
+const minFragBlks = (60 + 20) / 8 // max IPv4 header + basic TCP header in fragment blocks (8 bytes each)
 
 type TCPFlag uint8
 
@@ -152,11 +151,12 @@ func (q *Parsed) decode4(b []byte) {
 	// it as Unknown. We can also treat any subsequent fragment that starts
 	// at such a low offset as Unknown.
 	fragFlags := binary.BigEndian.Uint16(b[6:8])
-	moreFrags := (fragFlags & 0x20) != 0
+	moreFrags := (fragFlags & 0x2000) != 0
 	fragOfs := fragFlags & 0x1FFF
+
 	if fragOfs == 0 {
 		// This is the first fragment
-		if moreFrags && len(sub) < minFrag {
+		if moreFrags && len(sub) < minFragBlks {
 			// Suspiciously short first fragment, dump it.
 			q.IPProto = unknown
 			return
@@ -210,13 +210,15 @@ func (q *Parsed) decode4(b []byte) {
 			// Inter-tailscale messages.
 			q.dataofs = q.subofs
 			return
-		default:
+		case ipproto.Fragment:
+			// An IPProto value of 0xff (our Fragment constant for internal use)
+			// should never actually be used in the wild; if we see it,
+			// something's suspicious and we map it back to zero (unknown).
 			q.IPProto = unknown
-			return
 		}
 	} else {
 		// This is a fragment other than the first one.
-		if fragOfs < minFrag {
+		if fragOfs < minFragBlks {
 			// First frag was suspiciously short, so we can't
 			// trust the followup either.
 			q.IPProto = unknown
@@ -250,8 +252,8 @@ func (q *Parsed) decode6(b []byte) {
 
 	// okay to ignore `ok` here, because IPs pulled from packets are
 	// always well-formed stdlib IPs.
-	srcIP, _ := netaddr.FromStdIP(net.IP(b[8:24]))
-	dstIP, _ := netaddr.FromStdIP(net.IP(b[24:40]))
+	srcIP, _ := netip.AddrFromSlice(net.IP(b[8:24]))
+	dstIP, _ := netip.AddrFromSlice(net.IP(b[24:40]))
 	q.Src = withIP(q.Src, srcIP)
 	q.Dst = withIP(q.Dst, dstIP)
 
@@ -311,7 +313,10 @@ func (q *Parsed) decode6(b []byte) {
 		// Inter-tailscale messages.
 		q.dataofs = q.subofs
 		return
-	default:
+	case ipproto.Fragment:
+		// An IPProto value of 0xff (our Fragment constant for internal use)
+		// should never actually be used in the wild; if we see it,
+		// something's suspicious and we map it back to zero (unknown).
 		q.IPProto = unknown
 		return
 	}
@@ -435,6 +440,40 @@ func (q *Parsed) IsEchoResponse() bool {
 	}
 }
 
+// UpdateSrcAddr updates the source address in the packet buffer (e.g. during
+// SNAT). It also updates the checksum. Currently (2022-12-10) only TCP/UDP/ICMP
+// over IPv4 is supported. It panics if called with IPv6 addr.
+func (q *Parsed) UpdateSrcAddr(src netip.Addr) {
+	if q.IPVersion != 4 || src.Is6() {
+		panic("UpdateSrcAddr: only IPv4 is supported")
+	}
+
+	old := q.Src.Addr()
+	q.Src = netip.AddrPortFrom(src, q.Src.Port())
+
+	b := q.Buffer()
+	v4 := src.As4()
+	copy(b[12:16], v4[:])
+	updateV4PacketChecksums(q, old, src)
+}
+
+// UpdateDstAddr updates the source address in the packet buffer (e.g. during
+// DNAT). It also updates the checksum. Currently (2022-12-10) only TCP/UDP/ICMP
+// over IPv4 is supported. It panics if called with IPv6 addr.
+func (q *Parsed) UpdateDstAddr(dst netip.Addr) {
+	if q.IPVersion != 4 || dst.Is6() {
+		panic("UpdateDstAddr: only IPv4 is supported")
+	}
+
+	old := q.Dst.Addr()
+	q.Dst = netip.AddrPortFrom(dst, q.Dst.Port())
+
+	b := q.Buffer()
+	v4 := dst.As4()
+	copy(b[16:20], v4[:])
+	updateV4PacketChecksums(q, old, dst)
+}
+
 // EchoIDSeq extracts the identifier/sequence bytes from an ICMP Echo response,
 // and returns them as a uint32, used to lookup internally routed ICMP echo
 // responses. This function is intentionally lightweight as it is called on
@@ -496,4 +535,74 @@ func withIP(ap netip.AddrPort, ip netip.Addr) netip.AddrPort {
 
 func withPort(ap netip.AddrPort, port uint16) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr(), port)
+}
+
+// updateV4PacketChecksums updates the checksums in the packet buffer.
+// Currently (2023-03-01) only TCP/UDP/ICMP over IPv4 is supported.
+// p is modified in place.
+// If p.IPProto is unknown, only the IP header checksum is updated.
+// TODO(maisem): more protocols (sctp, gre, dccp)
+func updateV4PacketChecksums(p *Parsed, old, new netip.Addr) {
+	o4, n4 := old.As4(), new.As4()
+	updateV4Checksum(p.Buffer()[10:12], o4[:], n4[:]) // header
+	switch p.IPProto {
+	case ipproto.UDP:
+		updateV4Checksum(p.Transport()[6:8], o4[:], n4[:])
+	case ipproto.TCP:
+		updateV4Checksum(p.Transport()[16:18], o4[:], n4[:])
+	case ipproto.ICMPv4:
+		// Nothing to do.
+	}
+	// TODO(maisem): more protocols (sctp, gre, dccp)
+}
+
+// updateV4Checksum calculates and updates the checksum in the packet buffer for
+// a change between old and new. The oldSum must point to the 16-bit checksum
+// field in the packet buffer that holds the old checksum value, it will be
+// updated in place.
+//
+// The old and new must be the same length, and must be an even number of bytes.
+func updateV4Checksum(oldSum, old, new []byte) {
+	if len(old) != len(new) {
+		panic("old and new must be the same length")
+	}
+	if len(old)%2 != 0 {
+		panic("old and new must be of even length")
+	}
+	/*
+		RFC 1624
+		Given the following notation:
+
+		    HC  - old checksum in header
+		    C   - one's complement sum of old header
+		    HC' - new checksum in header
+		    C'  - one's complement sum of new header
+		    m   - old value of a 16-bit field
+		    m'  - new value of a 16-bit field
+
+		    HC' = ~(C + (-m) + m')  --    [Eqn. 3]
+		    HC' = ~(~HC + ~m + m')
+
+		This can be simplified to:
+		    HC' = ~(C + ~m + m')    --    [Eqn. 3]
+		    HC' = ~C'
+		    C'  = C + ~m + m'
+	*/
+
+	c := uint32(^binary.BigEndian.Uint16(oldSum))
+
+	cPrime := c
+	for len(new) > 0 {
+		mNot := uint32(^binary.BigEndian.Uint16(old[:2]))
+		mPrime := uint32(binary.BigEndian.Uint16(new[:2]))
+		cPrime += mPrime + mNot
+		new, old = new[2:], old[2:]
+	}
+
+	// Account for overflows by adding the carry bits back into the sum.
+	for (cPrime >> 16) > 0 {
+		cPrime = cPrime&0xFFFF + cPrime>>16
+	}
+	hcPrime := ^uint16(cPrime)
+	binary.BigEndian.PutUint16(oldSum, hcPrime)
 }

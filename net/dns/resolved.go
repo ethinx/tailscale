@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package dns
 
@@ -31,7 +29,9 @@ import (
 // In other cases, resolved may be managing the system DNS configuration directly.
 // Then the nameserver list will be a concatenation of those for all
 // the interfaces that register their interest in being a default resolver with
-//   SetLinkDomains([]{{"~.", true}, ...})
+//
+//	SetLinkDomains([]{{"~.", true}, ...})
+//
 // which includes at least the interface with the default route, i.e. not us.
 // This does not work for us: there is a possibility of getting NXDOMAIN
 // from the other nameservers before we are asked or get a chance to respond.
@@ -117,8 +117,10 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 }
 
 func (m *resolvedManager) SetDNS(config OSConfig) error {
+	// NOTE: don't close this channel, since it's possible that the SetDNS
+	// call will time out and return before the run loop answers, at which
+	// point it will send on the now-closed channel.
 	errc := make(chan error, 1)
-	defer close(errc)
 
 	select {
 	case <-m.ctx.Done():
@@ -203,7 +205,7 @@ func (m *resolvedManager) run(ctx context.Context) {
 			// When ctx goes away systemd-resolved auto reverts.
 			// Keeping for potential use in future refactor.
 			if call := rManager.CallWithContext(ctx, dbusResolvedInterface+".RevertLink", 0, m.ifidx); call.Err != nil {
-				m.logf("[v1] RevertLink: %w", call.Err)
+				m.logf("[v1] RevertLink: %v", call.Err)
 				return
 			}
 			return

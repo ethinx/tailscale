@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build android
-// +build android
 
 package netns
 
@@ -19,6 +17,11 @@ var (
 	androidProtectFuncMu sync.Mutex
 	androidProtectFunc   func(fd int) error
 )
+
+// UseSocketMark reports whether SO_MARK is in use. Android does not use SO_MARK.
+func UseSocketMark() bool {
+	return false
+}
 
 // SetAndroidProtectFunc register a func that Android provides that JNI calls into
 // https://developer.android.com/reference/android/net/VpnService#protect(int)

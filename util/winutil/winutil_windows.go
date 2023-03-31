@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package winutil
 
@@ -9,8 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"os/user"
 	"runtime"
+	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -80,7 +82,9 @@ func getRegInteger(name string, defval uint64) uint64 {
 func getRegStringInternal(subKey, name string) (string, error) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.READ)
 	if err != nil {
-		log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		if err != registry.ErrNotExist {
+			log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		}
 		return "", err
 	}
 	defer key.Close()
@@ -108,7 +112,9 @@ func GetRegStrings(name string, defval []string) []string {
 func getRegStringsInternal(subKey, name string) ([]string, error) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.READ)
 	if err != nil {
-		log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		if err != registry.ErrNotExist {
+			log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		}
 		return nil, err
 	}
 	defer key.Close()
@@ -146,6 +152,9 @@ func DeleteRegValue(name string) error {
 
 func deleteRegValueInternal(subKey, name string) error {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.SET_VALUE)
+	if err == registry.ErrNotExist {
+		return nil
+	}
 	if err != nil {
 		log.Printf("registry.OpenKey(%v): %v", subKey, err)
 		return err
@@ -162,7 +171,9 @@ func deleteRegValueInternal(subKey, name string) error {
 func getRegIntegerInternal(subKey, name string) (uint64, error) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.READ)
 	if err != nil {
-		log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		if err != registry.ErrNotExist {
+			log.Printf("registry.OpenKey(%v): %v", subKey, err)
+		}
 		return 0, err
 	}
 	defer key.Close()
@@ -390,4 +401,153 @@ func IsCurrentProcessElevated() bool {
 	defer token.Close()
 
 	return token.IsElevated()
+}
+
+// keyOpenTimeout is how long we wait for a registry key to appear. For some
+// reason, registry keys tied to ephemeral interfaces can take a long while to
+// appear after interface creation, and we can end up racing with that.
+const keyOpenTimeout = 20 * time.Second
+
+// RegistryPath represents a path inside a root registry.Key.
+type RegistryPath string
+
+// RegistryPathPrefix specifies a RegistryPath prefix that must be suffixed with
+// another RegistryPath to make a valid RegistryPath.
+type RegistryPathPrefix string
+
+// WithSuffix returns a RegistryPath with the given suffix appended.
+func (p RegistryPathPrefix) WithSuffix(suf string) RegistryPath {
+	return RegistryPath(string(p) + suf)
+}
+
+const (
+	IPv4TCPIPBase RegistryPath = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`
+	IPv6TCPIPBase RegistryPath = `SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`
+	NetBTBase     RegistryPath = `SYSTEM\CurrentControlSet\Services\NetBT\Parameters`
+
+	IPv4TCPIPInterfacePrefix RegistryPathPrefix = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\`
+	IPv6TCPIPInterfacePrefix RegistryPathPrefix = `SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\`
+	NetBTInterfacePrefix     RegistryPathPrefix = `SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_`
+)
+
+// ErrKeyWaitTimeout is returned by OpenKeyWait when calls timeout.
+var ErrKeyWaitTimeout = errors.New("timeout waiting for registry key")
+
+// OpenKeyWait opens a registry key, waiting for it to appear if necessary. It
+// returns the opened key, or ErrKeyWaitTimeout if the key does not appear
+// within 20s. The caller must call Close on the returned key.
+func OpenKeyWait(k registry.Key, path RegistryPath, access uint32) (registry.Key, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	deadline := time.Now().Add(keyOpenTimeout)
+	pathSpl := strings.Split(string(path), "\\")
+	for i := 0; ; i++ {
+		keyName := pathSpl[i]
+		isLast := i+1 == len(pathSpl)
+
+		event, err := windows.CreateEvent(nil, 0, 0, nil)
+		if err != nil {
+			return 0, fmt.Errorf("windows.CreateEvent: %w", err)
+		}
+		defer windows.CloseHandle(event)
+
+		var key registry.Key
+		for {
+			err = windows.RegNotifyChangeKeyValue(windows.Handle(k), false, windows.REG_NOTIFY_CHANGE_NAME, event, true)
+			if err != nil {
+				return 0, fmt.Errorf("windows.RegNotifyChangeKeyValue: %w", err)
+			}
+
+			var accessFlags uint32
+			if isLast {
+				accessFlags = access
+			} else {
+				accessFlags = registry.NOTIFY
+			}
+			key, err = registry.OpenKey(k, keyName, accessFlags)
+			if err == windows.ERROR_FILE_NOT_FOUND || err == windows.ERROR_PATH_NOT_FOUND {
+				timeout := time.Until(deadline) / time.Millisecond
+				if timeout < 0 {
+					timeout = 0
+				}
+				s, err := windows.WaitForSingleObject(event, uint32(timeout))
+				if err != nil {
+					return 0, fmt.Errorf("windows.WaitForSingleObject: %w", err)
+				}
+				if s == uint32(windows.WAIT_TIMEOUT) { // windows.WAIT_TIMEOUT status const is misclassified as error in golang.org/x/sys/windows
+					return 0, ErrKeyWaitTimeout
+				}
+			} else if err != nil {
+				return 0, fmt.Errorf("registry.OpenKey(%v): %w", path, err)
+			} else {
+				if isLast {
+					return key, nil
+				}
+				defer key.Close()
+				break
+			}
+		}
+
+		k = key
+	}
+}
+
+func lookupPseudoUser(uid string) (*user.User, error) {
+	sid, err := windows.StringToSid(uid)
+	if err != nil {
+		return nil, err
+	}
+
+	// We're looking for SIDs "S-1-5-x" where 17 <= x <= 20.
+	// This is checking for the the "5"
+	if sid.IdentifierAuthority() != windows.SECURITY_NT_AUTHORITY {
+		return nil, fmt.Errorf(`SID %q does not use "NT AUTHORITY"`, uid)
+	}
+
+	// This is ensuring that there is only one sub-authority.
+	// In other words, only one value after the "5".
+	if sid.SubAuthorityCount() != 1 {
+		return nil, fmt.Errorf("SID %q should have only one subauthority", uid)
+	}
+
+	// Get that sub-authority value (this is "x" above) and check it.
+	rid := sid.SubAuthority(0)
+	if rid < 17 || rid > 20 {
+		return nil, fmt.Errorf("SID %q does not represent a known pseudo-user", uid)
+	}
+
+	// We've got one of the known pseudo-users. Look up the localized name of the
+	// account.
+	username, domain, _, err := sid.LookupAccount("")
+	if err != nil {
+		return nil, err
+	}
+
+	// This call is best-effort. If it fails, homeDir will be empty.
+	homeDir, _ := findHomeDirInRegistry(uid)
+
+	result := &user.User{
+		Uid:      uid,
+		Gid:      uid, // Gid == Uid with these accounts.
+		Username: fmt.Sprintf(`%s\%s`, domain, username),
+		Name:     username,
+		HomeDir:  homeDir,
+	}
+	return result, nil
+}
+
+// findHomeDirInRegistry finds the user home path based on the uid.
+// This is borrowed from Go's std lib.
+func findHomeDirInRegistry(uid string) (dir string, err error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\`+uid, registry.QUERY_VALUE)
+	if err != nil {
+		return "", err
+	}
+	defer k.Close()
+	dir, _, err = k.GetStringValue("ProfileImagePath")
+	if err != nil {
+		return "", err
+	}
+	return dir, nil
 }

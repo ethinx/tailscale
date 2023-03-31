@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tlsdial originally existed to set up a tls.Config for x509
 // validation, using a memory-optimized path for iOS, but then we
@@ -12,9 +11,11 @@
 package tlsdial
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 )
 
 var counterFallbackOK int32 // atomic
@@ -32,7 +34,12 @@ var counterFallbackOK int32 // atomic
 // See https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format
 var sslKeyLogFile = os.Getenv("SSLKEYLOGFILE")
 
-var debug = envknob.Bool("TS_DEBUG_TLS_DIAL")
+var debug = envknob.RegisterBool("TS_DEBUG_TLS_DIAL")
+
+// tlsdialWarningPrinted tracks whether we've printed a warning about a given
+// hostname already, to avoid log spam for users with custom DERP servers,
+// Headscale, etc.
+var tlsdialWarningPrinted sync.Map // map[string]bool
 
 // Config returns a tls.Config for connecting to a server.
 // If base is non-nil, it's cloned as the base config before
@@ -67,6 +74,16 @@ func Config(host string, base *tls.Config) *tls.Config {
 	// (with the baked-in fallback root) in the VerifyConnection hook.
 	conf.InsecureSkipVerify = true
 	conf.VerifyConnection = func(cs tls.ConnectionState) error {
+		// Perform some health checks on this certificate before we do
+		// any verification.
+		if certIsSelfSigned(cs.PeerCertificates[0]) {
+			// Self-signed certs are never valid.
+			health.SetTLSConnectionError(cs.ServerName, fmt.Errorf("certificate is self-signed"))
+		} else {
+			// Ensure we clear any error state for this ServerName.
+			health.SetTLSConnectionError(cs.ServerName, nil)
+		}
+
 		// First try doing x509 verification with the system's
 		// root CA pool.
 		opts := x509.VerifyOptions{
@@ -77,27 +94,42 @@ func Config(host string, base *tls.Config) *tls.Config {
 			opts.Intermediates.AddCert(cert)
 		}
 		_, errSys := cs.PeerCertificates[0].Verify(opts)
-		if debug {
+		if debug() {
 			log.Printf("tlsdial(sys %q): %v", host, errSys)
 		}
-		if errSys == nil {
-			return nil
+
+		// Always verify with our baked-in Let's Encrypt certificate,
+		// so we can log an informational message. This is useful for
+		// detecting SSL MiTM.
+		opts.Roots = bakedInRoots()
+		_, bakedErr := cs.PeerCertificates[0].Verify(opts)
+		if debug() {
+			log.Printf("tlsdial(bake %q): %v", host, bakedErr)
+		} else if bakedErr != nil {
+			if _, loaded := tlsdialWarningPrinted.LoadOrStore(host, true); !loaded {
+				if errSys == nil {
+					log.Printf("tlsdial: warning: server cert for %q is not a Let's Encrypt cert", host)
+				} else {
+					log.Printf("tlsdial: error: server cert for %q failed to verify and is not a Let's Encrypt cert", host)
+				}
+			}
 		}
 
-		// If that failed, because the system's CA roots are old
-		// or broken, fall back to trying LetsEncrypt at least.
-		opts.Roots = bakedInRoots()
-		_, err := cs.PeerCertificates[0].Verify(opts)
-		if debug {
-			log.Printf("tlsdial(bake %q): %v", host, err)
-		}
-		if err == nil {
+		if errSys == nil {
+			return nil
+		} else if bakedErr == nil {
 			atomic.AddInt32(&counterFallbackOK, 1)
 			return nil
 		}
 		return errSys
 	}
 	return conf
+}
+
+func certIsSelfSigned(cert *x509.Certificate) bool {
+	// A certificate is determined to be self-signed if the certificate's
+	// subject is the same as its issuer.
+	return bytes.Equal(cert.RawSubject, cert.RawIssuer)
 }
 
 // SetConfigExpectedCert modifies c to expect and verify that the server returns
@@ -142,7 +174,7 @@ func SetConfigExpectedCert(c *tls.Config, certDNSName string) {
 			opts.Intermediates.AddCert(cert)
 		}
 		_, errSys := certs[0].Verify(opts)
-		if debug {
+		if debug() {
 			log.Printf("tlsdial(sys %q/%q): %v", c.ServerName, certDNSName, errSys)
 		}
 		if errSys == nil {
@@ -150,7 +182,7 @@ func SetConfigExpectedCert(c *tls.Config, certDNSName string) {
 		}
 		opts.Roots = bakedInRoots()
 		_, err := certs[0].Verify(opts)
-		if debug {
+		if debug() {
 			log.Printf("tlsdial(bake %q/%q): %v", c.ServerName, certDNSName, err)
 		}
 		if err == nil {
@@ -164,19 +196,20 @@ func SetConfigExpectedCert(c *tls.Config, certDNSName string) {
 letsEncryptX1 is the LetsEncrypt X1 root:
 
 Certificate:
-    Data:
-        Version: 3 (0x2)
-        Serial Number:
-            82:10:cf:b0:d2:40:e3:59:44:63:e0:bb:63:82:8b:00
-        Signature Algorithm: sha256WithRSAEncryption
-        Issuer: C = US, O = Internet Security Research Group, CN = ISRG Root X1
-        Validity
-            Not Before: Jun  4 11:04:38 2015 GMT
-            Not After : Jun  4 11:04:38 2035 GMT
-        Subject: C = US, O = Internet Security Research Group, CN = ISRG Root X1
-        Subject Public Key Info:
-            Public Key Algorithm: rsaEncryption
-                RSA Public-Key: (4096 bit)
+
+	Data:
+	    Version: 3 (0x2)
+	    Serial Number:
+	        82:10:cf:b0:d2:40:e3:59:44:63:e0:bb:63:82:8b:00
+	    Signature Algorithm: sha256WithRSAEncryption
+	    Issuer: C = US, O = Internet Security Research Group, CN = ISRG Root X1
+	    Validity
+	        Not Before: Jun  4 11:04:38 2015 GMT
+	        Not After : Jun  4 11:04:38 2035 GMT
+	    Subject: C = US, O = Internet Security Research Group, CN = ISRG Root X1
+	    Subject Public Key Info:
+	        Public Key Algorithm: rsaEncryption
+	            RSA Public-Key: (4096 bit)
 
 We bake it into the binary as a fallback verification root,
 in case the system we're running on doesn't have it.
@@ -189,7 +222,6 @@ $ sudo update-ca-certificates
 
 Then restart tailscaled. To also test dnsfallback's use of it, nuke
 your /etc/resolv.conf and it should still start & run fine.
-
 */
 const letsEncryptX1 = `
 -----BEGIN CERTIFICATE-----

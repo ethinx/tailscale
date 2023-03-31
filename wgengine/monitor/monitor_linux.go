@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !android
-// +build !android
 
 package monitor
 
@@ -16,12 +14,11 @@ import (
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 	"tailscale.com/envknob"
-	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 )
 
-var debugNetlinkMessages = envknob.Bool("TS_DEBUG_NETLINK")
+var debugNetlinkMessages = envknob.RegisterBool("TS_DEBUG_NETLINK")
 
 // unspecifiedMessage is a minimal message implementation that should not
 // be ignored. In general, OS-specific implementations should use better
@@ -97,7 +94,7 @@ func (c *nlConn) Receive() (message, error) {
 
 		nip := netaddrIP(rmsg.Attributes.Address)
 
-		if debugNetlinkMessages {
+		if debugNetlinkMessages() {
 			typ := "RTM_NEWADDR"
 			if msg.Header.Type == unix.RTM_DELADDR {
 				typ = "RTM_DELADDR"
@@ -126,7 +123,7 @@ func (c *nlConn) Receive() (message, error) {
 			}
 
 			if addrs[nip] {
-				if debugNetlinkMessages {
+				if debugNetlinkMessages() {
 					c.logf("ignored duplicate RTM_NEWADDR for %s", nip)
 				}
 				return ignoreMessage{}, nil
@@ -148,7 +145,7 @@ func (c *nlConn) Receive() (message, error) {
 			Addr:    nip,
 			Delete:  msg.Header.Type == unix.RTM_DELADDR,
 		}
-		if debugNetlinkMessages {
+		if debugNetlinkMessages() {
 			c.logf("%+v", nam)
 		}
 		return nam, nil
@@ -170,7 +167,7 @@ func (c *nlConn) Receive() (message, error) {
 			(rmsg.Attributes.Table == 255 || rmsg.Attributes.Table == 254) &&
 			(dst.Addr().IsMulticast() || dst.Addr().IsLinkLocalUnicast()) {
 
-			if debugNetlinkMessages {
+			if debugNetlinkMessages() {
 				c.logf("%s ignored", typeStr)
 			}
 
@@ -203,7 +200,7 @@ func (c *nlConn) Receive() (message, error) {
 			Dst:     dst,
 			Gateway: gw,
 		}
-		if debugNetlinkMessages {
+		if debugNetlinkMessages() {
 			c.logf("%+v", nrm)
 		}
 		return nrm, nil
@@ -226,10 +223,14 @@ func (c *nlConn) Receive() (message, error) {
 			table:    rmsg.Table,
 			priority: rmsg.Attributes.Priority,
 		}
-		if debugNetlinkMessages {
+		if debugNetlinkMessages() {
 			c.logf("%+v", rdm)
 		}
 		return rdm, nil
+	case unix.RTM_NEWLINK, unix.RTM_DELLINK:
+		// This is an unhandled message, but don't print an error.
+		// See https://github.com/tailscale/tailscale/issues/6806
+		return unspecifiedMessage{}, nil
 	default:
 		c.logf("unhandled netlink msg type %+v, %q", msg.Header, msg.Data)
 		return unspecifiedMessage{}, nil
@@ -237,13 +238,13 @@ func (c *nlConn) Receive() (message, error) {
 }
 
 func netaddrIP(std net.IP) netip.Addr {
-	ip, _ := netaddr.FromStdIP(std)
-	return ip
+	ip, _ := netip.AddrFromSlice(std)
+	return ip.Unmap()
 }
 
 func netaddrIPPrefix(std net.IP, bits uint8) netip.Prefix {
-	ip, _ := netaddr.FromStdIP(std)
-	return netip.PrefixFrom(ip, int(bits))
+	ip, _ := netip.AddrFromSlice(std)
+	return netip.PrefixFrom(ip.Unmap(), int(bits))
 }
 
 func condNetAddrPrefix(ipp netip.Prefix) string {

@@ -1,13 +1,11 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 )
@@ -29,6 +27,6 @@ func runIDToken(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Println(tr.IDToken)
+	outln(tr.IDToken)
 	return nil
 }

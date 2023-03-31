@@ -1,42 +1,43 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlhttp
 
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net"
 	"net/url"
 
 	"nhooyr.io/websocket"
 	"tailscale.com/control/controlbase"
-	"tailscale.com/net/dnscache"
-	"tailscale.com/types/key"
+	"tailscale.com/net/wsconn"
 )
 
 // Variant of Dial that tunnels the request over WebSockets, since we cannot do
 // bi-directional communication over an HTTP connection when in JS.
-func Dial(ctx context.Context, addr string, machineKey key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16, dialer dnscache.DialContextFunc) (*controlbase.Conn, error) {
-	init, cont, err := controlbase.ClientDeferred(machineKey, controlKey, protocolVersion)
+func (d *Dialer) Dial(ctx context.Context) (*ClientConn, error) {
+	if d.Hostname == "" {
+		return nil, errors.New("required Dialer.Hostname empty")
+	}
+
+	init, cont, err := controlbase.ClientDeferred(d.MachineKey, d.ControlKey, d.ProtocolVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
 	wsScheme := "wss"
-	wsHost := host
-	if host == "localhost" {
+	host := d.Hostname
+	// If using a custom control server (on a non-standard port), prefer that.
+	// This mirrors the port selection in newNoiseClient from noise.go.
+	if d.HTTPPort != "" && d.HTTPPort != "80" && d.HTTPSPort == "443" {
 		wsScheme = "ws"
-		wsHost = addr
+		host = net.JoinHostPort(host, d.HTTPPort)
 	}
 	wsURL := &url.URL{
 		Scheme: wsScheme,
-		Host:   wsHost,
+		Host:   host,
 		Path:   serverUpgradePath,
 		// Can't set HTTP headers on the websocket request, so we have to to send
 		// the handshake via an HTTP header.
@@ -50,12 +51,11 @@ func Dial(ctx context.Context, addr string, machineKey key.MachinePrivate, contr
 	if err != nil {
 		return nil, err
 	}
-	netConn := websocket.NetConn(context.Background(), wsConn, websocket.MessageBinary)
+	netConn := wsconn.NetConn(context.Background(), wsConn, websocket.MessageBinary)
 	cbConn, err := cont(ctx, netConn)
 	if err != nil {
 		netConn.Close()
 		return nil, err
 	}
-	return cbConn, nil
-
+	return &ClientConn{Conn: cbConn}, nil
 }

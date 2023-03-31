@@ -1,20 +1,24 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-package tailcfg
+package tailcfg_test
 
 import (
 	"encoding"
 	"encoding/json"
 	"net/netip"
+	"os"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	. "tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
+	"tailscale.com/util/must"
 	"tailscale.com/version"
 )
 
@@ -27,12 +31,39 @@ func fieldsOf(t reflect.Type) (fields []string) {
 
 func TestHostinfoEqual(t *testing.T) {
 	hiHandles := []string{
-		"IPNVersion", "FrontendLogID", "BackendLogID",
-		"OS", "OSVersion", "Desktop", "Package", "DeviceModel", "Hostname",
-		"ShieldsUp", "ShareeNode",
+		"IPNVersion",
+		"FrontendLogID",
+		"BackendLogID",
+		"OS",
+		"OSVersion",
+		"Container",
+		"Env",
+		"Distro",
+		"DistroVersion",
+		"DistroCodeName",
+		"App",
+		"Desktop",
+		"Package",
+		"DeviceModel",
+		"PushDeviceToken",
+		"Hostname",
+		"ShieldsUp",
+		"ShareeNode",
+		"NoLogsNoSupport",
+		"WireIngress",
+		"AllowsUpdate",
+		"Machine",
 		"GoArch",
-		"RoutableIPs", "RequestTags",
-		"Services", "NetInfo", "SSH_HostKeys", "Cloud",
+		"GoArchVar",
+		"GoVersion",
+		"RoutableIPs",
+		"RequestTags",
+		"Services",
+		"NetInfo",
+		"SSH_HostKeys",
+		"Cloud",
+		"Userspace",
+		"UserspaceRouter",
 	}
 	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -186,6 +217,16 @@ func TestHostinfoEqual(t *testing.T) {
 			&Hostinfo{},
 			false,
 		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "abc"},
+			false,
+		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "golink"},
+			true,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -301,12 +342,14 @@ func TestHostinfoTailscaleSSHEnabled(t *testing.T) {
 func TestNodeEqual(t *testing.T) {
 	nodeHandles := []string{
 		"ID", "StableID", "Name", "User", "Sharer",
-		"Key", "KeyExpiry", "Machine", "DiscoKey",
+		"Key", "KeyExpiry", "KeySignature", "Machine", "DiscoKey",
 		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
-		"Created", "Tags", "PrimaryRoutes",
+		"Created", "Cap", "Tags", "PrimaryRoutes",
 		"LastSeen", "Online", "KeepAlive", "MachineAuthorized",
 		"Capabilities",
+		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
+		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
 	}
 	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -486,6 +529,21 @@ func TestNodeEqual(t *testing.T) {
 			&Node{},
 			false,
 		},
+		{
+			&Node{Expired: true},
+			&Node{},
+			false,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV4MasqAddrForThisPeer: netip.MustParseAddr("100.64.0.1")},
+			false,
+		},
+		{
+			&Node{SelfNodeV4MasqAddrForThisPeer: netip.MustParseAddr("100.64.0.1")},
+			&Node{SelfNodeV4MasqAddrForThisPeer: netip.MustParseAddr("100.64.0.1")},
+			true,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -502,6 +560,7 @@ func TestNetInfoFields(t *testing.T) {
 		"WorkingIPv6",
 		"OSHasIPv6",
 		"WorkingUDP",
+		"WorkingICMPv4",
 		"HavePortMap",
 		"UPnP",
 		"PMP",
@@ -626,7 +685,7 @@ func BenchmarkKeyMarshalText(b *testing.B) {
 	b.ReportAllocs()
 	var k [32]byte
 	for i := 0; i < b.N; i++ {
-		sinkBytes = keyMarshalText("prefix", k)
+		sinkBytes = ExportKeyMarshalText("prefix", k)
 	}
 }
 
@@ -636,7 +695,7 @@ func TestAppendKeyAllocs(t *testing.T) {
 	}
 	var k [32]byte
 	err := tstest.MinAllocsPerRun(t, 1, func() {
-		sinkBytes = keyMarshalText("prefix", k)
+		sinkBytes = ExportKeyMarshalText("prefix", k)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -648,5 +707,22 @@ func TestRegisterRequestNilClone(t *testing.T) {
 	got := nilReq.Clone()
 	if got != nil {
 		t.Errorf("got = %v; want nil", got)
+	}
+}
+
+// Tests that CurrentCapabilityVersion is bumped when the comment block above it gets bumped.
+// We've screwed this up several times.
+func TestCurrentCapabilityVersion(t *testing.T) {
+	f := must.Get(os.ReadFile("tailcfg.go"))
+	matches := regexp.MustCompile(`(?m)^//[\s-]+(\d+): \d\d\d\d-\d\d-\d\d: `).FindAllStringSubmatch(string(f), -1)
+	max := 0
+	for _, m := range matches {
+		n := must.Get(strconv.Atoi(m[1]))
+		if n > max {
+			max = n
+		}
+	}
+	if CapabilityVersion(max) != CurrentCapabilityVersion {
+		t.Errorf("CurrentCapabilityVersion = %d; want %d", CurrentCapabilityVersion, max)
 	}
 }

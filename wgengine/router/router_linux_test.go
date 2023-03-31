@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -10,14 +9,18 @@ import (
 	"math/rand"
 	"net/netip"
 	"os"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/wireguard-go/tun"
 	"github.com/vishvananda/netlink"
-	"golang.zx2c4.com/wireguard/tun"
+	"golang.org/x/exp/slices"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/monitor"
@@ -25,13 +28,13 @@ import (
 
 func TestRouterStates(t *testing.T) {
 	basic := `
-ip rule add -4 pref 5210 fwmark 0x80000 table main
-ip rule add -4 pref 5230 fwmark 0x80000 table default
-ip rule add -4 pref 5250 fwmark 0x80000 type unreachable
+ip rule add -4 pref 5210 fwmark 0x80000/0xff0000 table main
+ip rule add -4 pref 5230 fwmark 0x80000/0xff0000 table default
+ip rule add -4 pref 5250 fwmark 0x80000/0xff0000 type unreachable
 ip rule add -4 pref 5270 table 52
-ip rule add -6 pref 5210 fwmark 0x80000 table main
-ip rule add -6 pref 5230 fwmark 0x80000 table default
-ip rule add -6 pref 5250 fwmark 0x80000 type unreachable
+ip rule add -6 pref 5210 fwmark 0x80000/0xff0000 table main
+ip rule add -6 pref 5230 fwmark 0x80000/0xff0000 table default
+ip rule add -6 pref 5250 fwmark 0x80000/0xff0000 type unreachable
 ip rule add -6 pref 5270 table 52
 `
 	states := []struct {
@@ -101,22 +104,22 @@ ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
 v4/filter/ts-input ! -i tailscale0 -s 100.115.92.0/23 -j RETURN
 v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
-v4/nat/ts-postrouting -m mark --mark 0x40000 -j MASQUERADE
+v4/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
-v6/nat/ts-postrouting -m mark --mark 0x40000 -j MASQUERADE
+v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
@@ -133,8 +136,8 @@ ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
@@ -143,8 +146,8 @@ v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
 `,
@@ -166,8 +169,8 @@ ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
@@ -176,8 +179,8 @@ v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
 `,
@@ -196,8 +199,8 @@ ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
@@ -206,8 +209,8 @@ v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
 `,
@@ -225,15 +228,15 @@ up
 ip addr add 100.101.102.104/10 dev tailscale0
 ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
-				`v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+				`v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
 v4/filter/ts-input ! -i tailscale0 -s 100.115.92.0/23 -j RETURN
 v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 `,
 		},
@@ -251,8 +254,8 @@ ip route add 10.0.0.0/8 dev tailscale0 table 52
 ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
@@ -261,8 +264,8 @@ v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
 `,
@@ -283,8 +286,8 @@ ip route add 100.100.100.100/32 dev tailscale0 table 52
 ip route add throw 10.0.0.0/8 table 52` + basic +
 				`v4/filter/FORWARD -j ts-forward
 v4/filter/INPUT -j ts-input
-v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v4/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
 v4/filter/ts-forward -o tailscale0 -j ACCEPT
 v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
@@ -293,8 +296,8 @@ v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
 v4/nat/POSTROUTING -j ts-postrouting
 v6/filter/FORWARD -j ts-forward
 v6/filter/INPUT -j ts-input
-v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000
-v6/filter/ts-forward -m mark --mark 0x40000 -j ACCEPT
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
 v6/filter/ts-forward -o tailscale0 -j ACCEPT
 v6/nat/POSTROUTING -j ts-postrouting
 `,
@@ -339,7 +342,7 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 			t.Fatalf("failed to set router config: %v", err)
 		}
 		got := fake.String()
-		want := strings.TrimSpace(states[i].want)
+		want := adjustFwmask(t, strings.TrimSpace(states[i].want))
 		if diff := cmp.Diff(got, want); diff != "" {
 			t.Fatalf("unexpected OS state (-got+want):\n%s", diff)
 		}
@@ -810,4 +813,133 @@ func TestCheckIPRuleSupportsV6(t *testing.T) {
 	// Just log it. For interactive testing only.
 	// Some machines running our tests might not have IPv6.
 	t.Logf("Got: %v", err)
+}
+
+func TestBusyboxParseVersion(t *testing.T) {
+	input := `BusyBox v1.34.1 (2022-09-01 16:10:29 UTC) multi-call binary.
+BusyBox is copyrighted by many authors between 1998-2015.
+Licensed under GPLv2. See source distribution for detailed
+copyright notices.
+
+Usage: busybox [function [arguments]...]
+   or: busybox --list[-full]
+   or: busybox --show SCRIPT
+   or: busybox --install [-s] [DIR]
+   or: function [arguments]...
+
+	BusyBox is a multi-call binary that combines many common Unix
+	utilities into a single executable.  Most people will create a
+	link to busybox for each function they wish to use and BusyBox
+	will act like whatever it was invoked as.
+`
+
+	v1, v2, v3, err := busyboxParseVersion(input)
+	if err != nil {
+		t.Fatalf("busyboxParseVersion() failed: %v", err)
+	}
+
+	if got, want := fmt.Sprintf("%d.%d.%d", v1, v2, v3), "1.34.1"; got != want {
+		t.Errorf("version = %q, want %q", got, want)
+	}
+}
+
+func TestCIDRDiff(t *testing.T) {
+	pfx := func(p ...string) []netip.Prefix {
+		var ret []netip.Prefix
+		for _, s := range p {
+			ret = append(ret, netip.MustParsePrefix(s))
+		}
+		return ret
+	}
+	tests := []struct {
+		old     []netip.Prefix
+		new     []netip.Prefix
+		wantAdd []netip.Prefix
+		wantDel []netip.Prefix
+		final   []netip.Prefix
+	}{
+		{
+			old:     nil,
+			new:     pfx("1.1.1.1/32"),
+			wantAdd: pfx("1.1.1.1/32"),
+			final:   pfx("1.1.1.1/32"),
+		},
+		{
+			old:   pfx("1.1.1.1/32"),
+			new:   pfx("1.1.1.1/32"),
+			final: pfx("1.1.1.1/32"),
+		},
+		{
+			old:     pfx("1.1.1.1/32", "2.3.4.5/32"),
+			new:     pfx("1.1.1.1/32"),
+			wantDel: pfx("2.3.4.5/32"),
+			final:   pfx("1.1.1.1/32"),
+		},
+		{
+			old:     pfx("1.1.1.1/32", "2.3.4.5/32"),
+			new:     pfx("1.0.0.0/32", "3.4.5.6/32"),
+			wantDel: pfx("1.1.1.1/32", "2.3.4.5/32"),
+			wantAdd: pfx("1.0.0.0/32", "3.4.5.6/32"),
+			final:   pfx("1.0.0.0/32", "3.4.5.6/32"),
+		},
+	}
+	for _, tc := range tests {
+		om := make(map[netip.Prefix]bool)
+		for _, p := range tc.old {
+			om[p] = true
+		}
+		var added []netip.Prefix
+		var deleted []netip.Prefix
+		fm, err := cidrDiff("test", om, tc.new, func(p netip.Prefix) error {
+			if len(deleted) > 0 {
+				t.Error("delete called before add")
+			}
+			added = append(added, p)
+			return nil
+		}, func(p netip.Prefix) error {
+			deleted = append(deleted, p)
+			return nil
+		}, t.Logf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slices.SortFunc(added, func(a, b netip.Prefix) bool { return a.Addr().Less(b.Addr()) })
+		slices.SortFunc(deleted, func(a, b netip.Prefix) bool { return a.Addr().Less(b.Addr()) })
+		if !reflect.DeepEqual(added, tc.wantAdd) {
+			t.Errorf("added = %v, want %v", added, tc.wantAdd)
+		}
+		if !reflect.DeepEqual(deleted, tc.wantDel) {
+			t.Errorf("deleted = %v, want %v", deleted, tc.wantDel)
+		}
+
+		// Check that the final state is correct.
+		if len(fm) != len(tc.final) {
+			t.Fatalf("final state = %v, want %v", fm, tc.final)
+		}
+		for _, p := range tc.final {
+			if !fm[p] {
+				t.Errorf("final state = %v, want %v", fm, tc.final)
+			}
+		}
+	}
+}
+
+var (
+	fwmaskSupported     bool
+	fwmaskSupportedOnce sync.Once
+	fwmaskAdjustRe      = regexp.MustCompile(`(?m)(fwmark 0x[0-9a-f]+)/0x[0-9a-f]+`)
+)
+
+// adjustFwmask removes the "/0xmask" string from fwmask stanzas if the
+// installed 'ip' binary does not support that format.
+func adjustFwmask(t *testing.T, s string) string {
+	t.Helper()
+	fwmaskSupportedOnce.Do(func() {
+		fwmaskSupported, _ = ipCmdSupportsFwmask()
+	})
+	if fwmaskSupported {
+		return s
+	}
+
+	return fwmaskAdjustRe.ReplaceAllString(s, "$1")
 }

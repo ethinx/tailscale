@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -11,8 +10,6 @@ import (
 	"fmt"
 	"net/netip"
 	"time"
-
-	"tailscale.com/net/netaddr"
 )
 
 // References:
@@ -20,7 +17,7 @@ import (
 // https://www.rfc-editor.org/rfc/pdfrfc/rfc6887.txt.pdf
 // https://tools.ietf.org/html/rfc6887
 
-//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
+//go:generate go run tailscale.com/cmd/addlicense -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
 
 type pcpResultCode uint8
 
@@ -126,7 +123,7 @@ func parsePCPMapResponse(resp []byte) (*pcpMapping, error) {
 	externalPort := binary.BigEndian.Uint16(resp[42:44])
 	externalIPBytes := [16]byte{}
 	copy(externalIPBytes[:], resp[44:])
-	externalIP := netaddr.IPFrom16(externalIPBytes)
+	externalIP := netip.AddrFrom16(externalIPBytes).Unmap()
 
 	external := netip.AddrPortFrom(externalIP, externalPort)
 

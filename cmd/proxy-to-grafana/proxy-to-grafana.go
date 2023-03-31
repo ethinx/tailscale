@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // proxy-to-grafana is a reverse proxy which identifies users based on their
 // originating Tailscale identity and maps them to corresponding Grafana
@@ -14,14 +13,14 @@
 //
 // Use this Grafana configuration to enable the auth proxy:
 //
-//     [auth.proxy]
-//     enabled = true
-//     header_name = X-WEBAUTH-USER
-//     header_property = username
-//     auto_sign_up = true
-//     whitelist = 127.0.0.1
-//     headers = Name:X-WEBAUTH-NAME
-//     enable_login_token = true
+//	[auth.proxy]
+//	enabled = true
+//	header_name = X-WEBAUTH-USER
+//	header_property = username
+//	auto_sign_up = true
+//	whitelist = 127.0.0.1
+//	headers = Name:X-WEBAUTH-NAME
+//	enable_login_token = true
 package main
 
 import (
@@ -148,7 +147,7 @@ func getTailscaleUser(ctx context.Context, localClient *tailscale.LocalClient, i
 	if err != nil {
 		return nil, fmt.Errorf("failed to identify remote host: %w", err)
 	}
-	if len(whois.Node.Tags) != 0 {
+	if whois.Node.IsTagged() {
 		return nil, fmt.Errorf("tagged nodes are not users")
 	}
 	if whois.UserProfile == nil || whois.UserProfile.LoginName == "" {

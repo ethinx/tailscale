@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -10,6 +9,7 @@ import (
 	"fmt"
 
 	"golang.org/x/crypto/argon2"
+	"tailscale.com/types/tkatype"
 )
 
 // ErrNoSuchKey is returned if the key referenced by a KeyID does not exist.
@@ -28,21 +28,28 @@ type State struct {
 
 	// DisablementSecrets are KDF-derived values which can be used
 	// to turn off the TKA in the event of a consensus-breaking bug.
-	// An AUM of type DisableNL should contain a secret when results
-	// in one of these values when run through the disablement KDF.
-	//
-	// TODO(tom): This is an alpha feature, remove this mechanism once
-	//            we have confidence in our implementation.
 	DisablementSecrets [][]byte `cbor:"2,keyasint"`
 
 	// Keys are the public keys currently trusted by the TKA.
 	Keys []Key `cbor:"3,keyasint"`
+
+	// StateID's are nonce's, generated on enablement and fixed for
+	// the lifetime of the Tailnet Key Authority. We generate 16-bytes
+	// worth of keyspace here just in case we come up with a cool future
+	// use for this.
+	StateID1 uint64 `cbor:"4,keyasint,omitempty"`
+	StateID2 uint64 `cbor:"5,keyasint,omitempty"`
 }
 
 // GetKey returns the trusted key with the specified KeyID.
-func (s State) GetKey(key KeyID) (Key, error) {
+func (s State) GetKey(key tkatype.KeyID) (Key, error) {
 	for _, k := range s.Keys {
-		if bytes.Equal(k.ID(), key) {
+		keyID, err := k.ID()
+		if err != nil {
+			return Key{}, err
+		}
+
+		if bytes.Equal(keyID, key) {
 			return k, nil
 		}
 	}
@@ -56,7 +63,10 @@ func (s State) GetKey(key KeyID) (Key, error) {
 // slice for encoding purposes, so an implementation of Clone()
 // must take care to preserve this.
 func (s State) Clone() State {
-	out := State{}
+	out := State{
+		StateID1: s.StateID1,
+		StateID2: s.StateID2,
+	}
 
 	if s.LastAUMHash != nil {
 		dupe := *s.LastAUMHash
@@ -94,7 +104,13 @@ const disablementLength = 32
 
 var disablementSalt = []byte("tailscale network-lock disablement salt")
 
-func disablementKDF(secret []byte) []byte {
+// DisablementKDF computes a public value which can be stored in a
+// key authority, but cannot be reversed to find the input secret.
+//
+// When the output of this function is stored in tka state (i.e. in
+// tka.State.DisablementSecrets) a call to Authority.ValidDisablement()
+// with the input of this function as the argument will return true.
+func DisablementKDF(secret []byte) []byte {
 	// time = 4 (3 recommended, booped to 4 to compensate for less memory)
 	// memory = 16 (32 recommended)
 	// threads = 4
@@ -104,7 +120,7 @@ func disablementKDF(secret []byte) []byte {
 
 // checkDisablement returns true for a valid disablement secret.
 func (s State) checkDisablement(secret []byte) bool {
-	derived := disablementKDF(secret)
+	derived := DisablementKDF(secret)
 	for _, candidate := range s.DisablementSecrets {
 		if bytes.Equal(derived, candidate) {
 			return true
@@ -144,10 +160,24 @@ func (s State) applyVerifiedAUM(update AUM) (State, error) {
 		return out, nil
 
 	case AUMCheckpoint:
+		if update.State == nil {
+			return State{}, errors.New("missing checkpoint state")
+		}
+		id1Match, id2Match := update.State.StateID1 == s.StateID1, update.State.StateID2 == s.StateID2
+		if !id1Match || !id2Match {
+			return State{}, errors.New("checkpointed state has an incorrect stateID")
+		}
 		return update.State.cloneForUpdate(&update), nil
 
 	case AUMAddKey:
-		if _, err := s.GetKey(update.Key.ID()); err == nil {
+		if update.Key == nil {
+			return State{}, errors.New("no key to add provided")
+		}
+		keyID, err := update.Key.ID()
+		if err != nil {
+			return State{}, err
+		}
+		if _, err := s.GetKey(keyID); err == nil {
 			return State{}, errors.New("key already exists")
 		}
 		out := s.cloneForUpdate(&update)
@@ -165,9 +195,16 @@ func (s State) applyVerifiedAUM(update AUM) (State, error) {
 		if update.Meta != nil {
 			k.Meta = update.Meta
 		}
+		if err := k.StaticValidate(); err != nil {
+			return State{}, fmt.Errorf("updated key fails validation: %v", err)
+		}
 		out := s.cloneForUpdate(&update)
 		for i := range out.Keys {
-			if bytes.Equal(out.Keys[i].ID(), update.KeyID) {
+			keyID, err := out.Keys[i].ID()
+			if err != nil {
+				return State{}, err
+			}
+			if bytes.Equal(keyID, update.KeyID) {
 				out.Keys[i] = k
 			}
 		}
@@ -176,7 +213,11 @@ func (s State) applyVerifiedAUM(update AUM) (State, error) {
 	case AUMRemoveKey:
 		idx := -1
 		for i := range s.Keys {
-			if bytes.Equal(update.KeyID, s.Keys[i].ID()) {
+			keyID, err := s.Keys[i].ID()
+			if err != nil {
+				return State{}, err
+			}
+			if bytes.Equal(update.KeyID, keyID) {
 				idx = i
 				break
 			}
@@ -188,17 +229,84 @@ func (s State) applyVerifiedAUM(update AUM) (State, error) {
 		out.Keys = append(out.Keys[:idx], out.Keys[idx+1:]...)
 		return out, nil
 
-	case AUMDisableNL:
-		// TODO(tom): We should handle this at a higher level than State.
-		if !s.checkDisablement(update.DisablementSecret) {
-			return State{}, errors.New("incorrect disablement secret")
-		}
-		// Valid disablement secret, lets reset
-		return State{}, nil
-
 	default:
-		// TODO(tom): Instead of erroring, update lastHash and
-		// continue (to preserve future compatibility).
-		return State{}, fmt.Errorf("unhandled message: %v", update.MessageKind)
+		// An AUM with an unknown message kind was received! That means
+		// that a future version of tailscaled added some feature we don't
+		// understand.
+		//
+		// The future-compatibility contract for AUM message types is that
+		// they must only add new features, not change the semantics of existing
+		// mechanisms or features. As such, old clients can safely ignore them.
+		out := s.cloneForUpdate(&update)
+		return out, nil
 	}
+}
+
+// Upper bound on checkpoint elements, chosen arbitrarily. Intended to
+// cap out insanely large AUMs.
+const (
+	maxDisablementSecrets = 32
+	maxKeys               = 512
+)
+
+// staticValidateCheckpoint validates that the state is well-formed for
+// inclusion in a checkpoint AUM.
+func (s *State) staticValidateCheckpoint() error {
+	if s.LastAUMHash != nil {
+		return errors.New("cannot specify a parent AUM")
+	}
+	if len(s.DisablementSecrets) == 0 {
+		return errors.New("at least one disablement secret required")
+	}
+	if numDS := len(s.DisablementSecrets); numDS > maxDisablementSecrets {
+		return fmt.Errorf("too many disablement secrets (%d, max %d)", numDS, maxDisablementSecrets)
+	}
+	for i, ds := range s.DisablementSecrets {
+		if len(ds) != disablementLength {
+			return fmt.Errorf("disablement[%d]: invalid length (got %d, want %d)", i, len(ds), disablementLength)
+		}
+		for j, ds2 := range s.DisablementSecrets {
+			if i == j {
+				continue
+			}
+			if bytes.Equal(ds, ds2) {
+				return fmt.Errorf("disablement[%d]: duplicates disablement[%d]", i, j)
+			}
+		}
+	}
+
+	if len(s.Keys) == 0 {
+		return errors.New("at least one key is required")
+	}
+	if numKeys := len(s.Keys); numKeys > maxKeys {
+		return fmt.Errorf("too many keys (%d, max %d)", numKeys, maxKeys)
+	}
+	for i, k := range s.Keys {
+		if err := k.StaticValidate(); err != nil {
+			return fmt.Errorf("key[%d]: %v", i, err)
+		}
+	}
+	// NOTE: The max number of keys is constrained (512), so
+	// O(n^2) is fine.
+	for i, k := range s.Keys {
+		for j, k2 := range s.Keys {
+			if i == j {
+				continue
+			}
+
+			id1, err := k.ID()
+			if err != nil {
+				return fmt.Errorf("key[%d]: %w", i, err)
+			}
+			id2, err := k2.ID()
+			if err != nil {
+				return fmt.Errorf("key[%d]: %w", j, err)
+			}
+
+			if bytes.Equal(id1, id2) {
+				return fmt.Errorf("key[%d]: duplicates key[%d]", i, j)
+			}
+		}
+	}
+	return nil
 }

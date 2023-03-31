@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tsweb
 
@@ -14,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +21,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"tailscale.com/metrics"
 	"tailscale.com/tstest"
+	"tailscale.com/util/vizerror"
+	"tailscale.com/version"
 )
 
 type noopHijacker struct {
@@ -147,6 +149,40 @@ func TestStdHandler(t *testing.T) {
 				RequestURI: "/foo",
 				Err:        "not found",
 				Code:       404,
+			},
+		},
+
+		{
+			name:     "handler returns user-visible error",
+			rh:       handlerErr(0, vizerror.New("visible error")),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+			},
+		},
+
+		{
+			name:     "handler returns user-visible error wrapped by private error",
+			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       clock.Start,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
 			},
 		},
 
@@ -303,7 +339,7 @@ func BenchmarkLogNot200(b *testing.B) {
 		// Implicit 200 OK.
 		return nil
 	})
-	h := StdHandler(rh, HandlerOptions{Quiet200s: true})
+	h := StdHandler(rh, HandlerOptions{QuietLoggingIfSuccessful: true})
 	req := httptest.NewRequest("GET", "/", nil)
 	rw := new(httptest.ResponseRecorder)
 	for i := 0; i < b.N; i++ {
@@ -324,6 +360,14 @@ func BenchmarkLog(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		*rw = httptest.ResponseRecorder{}
 		h.ServeHTTP(rw, req)
+	}
+}
+
+func TestHTTPError_Unwrap(t *testing.T) {
+	wrappedErr := fmt.Errorf("wrapped")
+	err := Error(404, "not found", wrappedErr)
+	if got := errors.Unwrap(err); got != wrappedErr {
+		t.Errorf("HTTPError.Unwrap() = %v, want %v", got, wrappedErr)
 	}
 }
 
@@ -348,6 +392,12 @@ func TestVarzHandler(t *testing.T) {
 			"foo",
 			new(expvar.Int),
 			"# TYPE foo counter\nfoo 0\n",
+		},
+		{
+			"dash_in_metric_name",
+			"counter_foo-bar",
+			new(expvar.Int),
+			"# TYPE foo_bar counter\nfoo_bar 0\n",
 		},
 		{
 			"int_with_type_counter",
@@ -434,15 +484,15 @@ func TestVarzHandler(t *testing.T) {
 		},
 		{
 			"func_float64_gauge",
-			"gauge_x",
+			"gauge_y",
 			expvar.Func(func() any { return float64(1.2) }),
-			"# TYPE x gauge\nx 1.2\n",
+			"# TYPE y gauge\ny 1.2\n",
 		},
 		{
 			"func_float64_untyped",
-			"x",
+			"z",
 			expvar.Func(func() any { return float64(1.2) }),
-			"x 1.2\n",
+			"z 1.2\n",
 		},
 		{
 			"metrics_label_map",
@@ -488,24 +538,24 @@ func TestVarzHandler(t *testing.T) {
 			"foo",
 			someExpVarWithJSONAndPromTypes(),
 			strings.TrimSpace(`
-# TYPE foo_nestvalue_foo gauge
-foo_nestvalue_foo 1
-# TYPE foo_nestvalue_bar counter
-foo_nestvalue_bar 2
-# TYPE foo_nestptr_foo gauge
-foo_nestptr_foo 10
-# TYPE foo_nestptr_bar counter
-foo_nestptr_bar 20
-# TYPE foo_curX gauge
-foo_curX 3
-# TYPE foo_totalY counter
-foo_totalY 4
-# TYPE foo_curTemp gauge
-foo_curTemp 20.6
-# TYPE foo_AnInt8 counter
-foo_AnInt8 127
 # TYPE foo_AUint16 counter
 foo_AUint16 65535
+# TYPE foo_AnInt8 counter
+foo_AnInt8 127
+# TYPE foo_curTemp gauge
+foo_curTemp 20.6
+# TYPE foo_curX gauge
+foo_curX 3
+# TYPE foo_nestptr_bar counter
+foo_nestptr_bar 20
+# TYPE foo_nestptr_foo gauge
+foo_nestptr_foo 10
+# TYPE foo_nestvalue_bar counter
+foo_nestvalue_bar 2
+# TYPE foo_nestvalue_foo gauge
+foo_nestvalue_foo 1
+# TYPE foo_totalY counter
+foo_totalY 4
 `) + "\n",
 		},
 		{
@@ -526,13 +576,33 @@ foo_AUint16 65535
 			promWriter{},
 			"custom_var_value 42\n",
 		},
+		{
+			"string_version_var",
+			"foo_version",
+			expvar.Func(func() any { return "1.2.3-foo15" }),
+			"foo_version{version=\"1.2.3-foo15\"} 1\n",
+		},
+		{
+			"field_ordering",
+			"foo",
+			someExpVarWithFieldNamesSorting(),
+			strings.TrimSpace(`
+# TYPE foo_bar_a gauge
+foo_bar_a 1
+# TYPE foo_bar_b counter
+foo_bar_b 1
+# TYPE foo_foo_a gauge
+foo_foo_a 1
+# TYPE foo_foo_b counter
+foo_foo_b 1
+`) + "\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defer func() { expvarDo = expvar.Do }()
-			expvarDo = func(f func(expvar.KeyValue)) {
+			tstest.Replace(t, &expvarDo, func(f func(expvar.KeyValue)) {
 				f(expvar.KeyValue{Key: tt.k, Value: tt.v})
-			}
+			})
 			rec := httptest.NewRecorder()
 			VarzHandler(rec, httptest.NewRequest("GET", "/", nil))
 			if got := rec.Body.Bytes(); string(got) != tt.want {
@@ -589,6 +659,38 @@ type expvarAdapter struct {
 func (expvarAdapter) String() string { return "{}" } // expvar JSON; unused in test
 
 func (a expvarAdapter) PrometheusMetricsReflectRoot() any {
+	return a.st
+}
+
+// SomeTestOfFieldNamesSorting demonstrates field
+// names that are not in sorted in declaration order, to verify
+// that we sort based on field name
+type SomeTestOfFieldNamesSorting struct {
+	FooAG int64 `json:"foo_a" metrictype:"gauge"`
+	BarAG int64 `json:"bar_a" metrictype:"gauge"`
+	FooBC int64 `json:"foo_b" metrictype:"counter"`
+	BarBC int64 `json:"bar_b" metrictype:"counter"`
+}
+
+// someExpVarWithFieldNamesSorting returns an expvar.Var that
+// implements PrometheusMetricsReflectRooter for TestVarzHandler.
+func someExpVarWithFieldNamesSorting() expvar.Var {
+	st := &SomeTestOfFieldNamesSorting{
+		FooAG: 1,
+		BarAG: 1,
+		FooBC: 1,
+		BarBC: 1,
+	}
+	return expvarAdapter2{st}
+}
+
+type expvarAdapter2 struct {
+	st *SomeTestOfFieldNamesSorting
+}
+
+func (expvarAdapter2) String() string { return "{}" } // expvar JSON; unused in test
+
+func (a expvarAdapter2) PrometheusMetricsReflectRoot() any {
 	return a.st
 }
 
@@ -669,5 +771,47 @@ func TestPort80Handler(t *testing.T) {
 				t.Errorf("Location = %q; want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestSortedStructAllocs(t *testing.T) {
+	f := reflect.ValueOf(struct {
+		Foo int
+		Bar int
+		Baz int
+	}{})
+	n := testing.AllocsPerRun(1000, func() {
+		foreachExportedStructField(f, func(fieldOrJSONName, metricType string, rv reflect.Value) {
+			// Nothing.
+		})
+	})
+	if n != 0 {
+		t.Errorf("allocs = %v; want 0", n)
+	}
+}
+
+func TestVarzHandlerSorting(t *testing.T) {
+	tstest.Replace(t, &expvarDo, func(f func(expvar.KeyValue)) {
+		f(expvar.KeyValue{Key: "counter_zz", Value: new(expvar.Int)})
+		f(expvar.KeyValue{Key: "gauge_aa", Value: new(expvar.Int)})
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	VarzHandler(rec, req)
+	got := rec.Body.Bytes()
+	const want = "# TYPE aa gauge\naa 0\n# TYPE zz counter\nzz 0\n"
+	if string(got) != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
+	rec = new(httptest.ResponseRecorder) // without a body
+
+	// Lock in the current number of allocs, to prevent it from growing.
+	if !version.IsRace() {
+		allocs := int(testing.AllocsPerRun(1000, func() {
+			VarzHandler(rec, req)
+		}))
+		if max := 13; allocs > max {
+			t.Errorf("allocs = %v; want max %v", allocs, max)
+		}
 	}
 }

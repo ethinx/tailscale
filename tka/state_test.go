@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -42,6 +41,13 @@ func TestCloneState(t *testing.T) {
 			"Key",
 			State{
 				Keys: []Key{{Kind: Key25519, Votes: 2, Public: []byte{5, 6, 7, 8}, Meta: map[string]string{"a": "b"}}},
+			},
+		},
+		{
+			"StateID",
+			State{
+				StateID1: 42,
+				StateID2: 22,
 			},
 		},
 		{
@@ -121,7 +127,7 @@ func TestApplyUpdatesChain(t *testing.T) {
 				LastAUMHash: hashFromHex("53898e4311d0b6087fcbb871563868a16c629d9267df851fcfa7b52b31d2bd03"),
 			},
 			State{
-				LastAUMHash: hashFromHex("828fe04c16032cf3e0b021abca0b4d79924b0a18b2e627b308347aa87ce7c21c"),
+				LastAUMHash: hashFromHex("d55458a9c3ed6997439ba5a18b9b62d2c6e5e0c1bb4c61409e92a1281a3b458d"),
 				Keys:        []Key{{Kind: Key25519, Votes: 1, Meta: map[string]string{"a": "b"}, Public: []byte{1, 2, 3, 4}}},
 			},
 		},
@@ -140,15 +146,6 @@ func TestApplyUpdatesChain(t *testing.T) {
 			},
 		},
 		{
-			"Disablement",
-			[]AUM{{MessageKind: AUMDisableNL, DisablementSecret: []byte{1, 2, 3, 4}, PrevAUMHash: fromHex("53898e4311d0b6087fcbb871563868a16c629d9267df851fcfa7b52b31d2bd03")}},
-			State{
-				DisablementSecrets: [][]byte{disablementKDF([]byte{1, 2, 3, 4})},
-				LastAUMHash:        hashFromHex("53898e4311d0b6087fcbb871563868a16c629d9267df851fcfa7b52b31d2bd03"),
-			},
-			State{},
-		},
-		{
 			"Checkpoint",
 			[]AUM{
 				{MessageKind: AUMAddKey, Key: &Key{Kind: Key25519, Public: []byte{5, 6, 7, 8}}},
@@ -159,7 +156,7 @@ func TestApplyUpdatesChain(t *testing.T) {
 			State{DisablementSecrets: [][]byte{[]byte{1, 2, 3, 4}}},
 			State{
 				Keys:        []Key{{Kind: Key25519, Public: []byte{1, 2, 3, 4}}},
-				LastAUMHash: hashFromHex("2e34f7e21883c35c8e34ec06e735f7ed8a14c3ceeb11ccb18fcbc11d51c8dabb"),
+				LastAUMHash: hashFromHex("57343671da5eea3cfb502954e976e8028bffd3540b50a043b2a65a8d8d8217d0"),
 			},
 		},
 	}
@@ -177,10 +174,8 @@ func TestApplyUpdatesChain(t *testing.T) {
 				// t.Logf("update[%d] end-state = %+v", i, state)
 
 				updateHash := tc.Updates[i].Hash()
-				if tc.Updates[i].MessageKind != AUMDisableNL {
-					if got, want := *state.LastAUMHash, updateHash[:]; !bytes.Equal(got[:], want) {
-						t.Errorf("expected state.LastAUMHash = %x (update %d), got %x", want, i, got)
-					}
+				if got, want := *state.LastAUMHash, updateHash[:]; !bytes.Equal(got[:], want) {
+					t.Errorf("expected state.LastAUMHash = %x (update %d), got %x", want, i, got)
 				}
 			}
 
@@ -192,6 +187,7 @@ func TestApplyUpdatesChain(t *testing.T) {
 }
 
 func TestApplyUpdateErrors(t *testing.T) {
+	tooLargeVotes := uint(99999)
 	tcs := []struct {
 		Name    string
 		Updates []AUM
@@ -217,6 +213,12 @@ func TestApplyUpdateErrors(t *testing.T) {
 			ErrNoSuchKey,
 		},
 		{
+			"UpdateKey now fails validation",
+			[]AUM{{MessageKind: AUMUpdateKey, KeyID: []byte{1}, Votes: &tooLargeVotes}},
+			State{Keys: []Key{{Kind: Key25519, Public: []byte{1}}}},
+			errors.New("updated key fails validation: excessive key weight: 99999 > 4096"),
+		},
+		{
 			"Bad lastAUMHash",
 			[]AUM{
 				{MessageKind: AUMAddKey, Key: &Key{Kind: Key25519, Public: []byte{5, 6, 7, 8}}},
@@ -226,6 +228,12 @@ func TestApplyUpdateErrors(t *testing.T) {
 				Keys: []Key{{Kind: Key25519, Public: []byte{1, 2, 3, 4}}},
 			},
 			errors.New("parent AUMHash mismatch"),
+		},
+		{
+			"Bad StateID",
+			[]AUM{{MessageKind: AUMCheckpoint, State: &State{StateID1: 1}}},
+			State{Keys: []Key{{Kind: Key25519, Public: []byte{1}}}, StateID1: 42},
+			errors.New("checkpointed state has an incorrect stateID"),
 		},
 	}
 

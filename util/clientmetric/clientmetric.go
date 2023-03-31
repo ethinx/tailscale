@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package clientmetric provides client-side metrics whose values
 // get occasionally logged.
@@ -197,7 +196,7 @@ func WritePrometheusExpositionFormat(w io.Writer) {
 const (
 	// metricLogNameFrequency is how often a metric's name=>id
 	// mapping is redundantly put in the logs. In other words,
-	// this is how how far in the logs you need to fetch from a
+	// this is how far in the logs you need to fetch from a
 	// given point in time to recompute the metrics at that point
 	// in time.
 	metricLogNameFrequency = 4 * time.Hour
@@ -216,11 +215,11 @@ const (
 // without further escaping.
 //
 // The current encoding is:
-//   * name immediately following metric:
+//   - name immediately following metric:
 //     'N' + hex(varint(len(name))) + name
-//   * set value of a metric:
+//   - set value of a metric:
 //     'S' + hex(varint(wireid)) + hex(varint(value))
-//   * increment a metric: (decrements if negative)
+//   - increment a metric: (decrements if negative)
 //     'I' + hex(varint(wireid)) + hex(varint(value))
 func EncodeLogTailMetricsDelta() string {
 	mu.Lock()

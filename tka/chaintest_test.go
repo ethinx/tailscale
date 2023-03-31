@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
@@ -15,6 +14,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"tailscale.com/types/tkatype"
 )
 
 // chaintest_test.go implements test helpers for concisely describing
@@ -265,8 +265,8 @@ func (c *testChain) makeAUM(v *testchainNode) AUM {
 
 	sigHash := aum.SigHash()
 	for _, key := range c.SignAllKeys {
-		aum.Signatures = append(aum.Signatures, Signature{
-			KeyID:     c.Key[key].ID(),
+		aum.Signatures = append(aum.Signatures, tkatype.Signature{
+			KeyID:     c.Key[key].MustID(),
 			Signature: ed25519.Sign(c.KeyPrivs[key], sigHash[:]),
 		})
 	}
@@ -274,8 +274,8 @@ func (c *testChain) makeAUM(v *testchainNode) AUM {
 	// If the aum was specified as being signed by some key, then
 	// sign it using that key.
 	if key := v.SignedWith; key != "" {
-		aum.Signatures = append(aum.Signatures, Signature{
-			KeyID:     c.Key[key].ID(),
+		aum.Signatures = append(aum.Signatures, tkatype.Signature{
+			KeyID:     c.Key[key].MustID(),
 			Signature: ed25519.Sign(c.KeyPrivs[key], sigHash[:]),
 		})
 	}

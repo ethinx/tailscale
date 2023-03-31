@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgengine
 
@@ -9,7 +8,6 @@ import (
 	"runtime"
 	"time"
 
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/flowtrack"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
@@ -157,19 +155,8 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 		return
 	}
 
-	var ps *ipnstate.PeerStatusLite
-	if st, err := e.getStatus(); err == nil {
-		for _, v := range st.Peers {
-			if v.NodeKey == n.Key {
-				v := v // copy
-				ps = &v
-			}
-		}
-	} else {
-		e.logf("open-conn-track: timeout opening %v to node %v; failed to get engine status: %v", flow, n.Key.ShortString(), err)
-		return
-	}
-	if ps == nil {
+	ps, found := e.getPeerStatusLite(n.Key)
+	if !found {
 		onlyZeroRoute := true // whether peerForIP returned n only because its /0 route matched
 		for _, r := range n.AllowedIPs {
 			if r.Bits() != 0 && r.Contains(flow.Dst.Addr()) {

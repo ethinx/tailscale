@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package resolver implements a stub DNS resolver that can also serve
 // records out of an internal local zone.
@@ -21,14 +20,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/envknob"
 	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/syncs"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
@@ -342,7 +342,7 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 	default:
 		return nil, errors.New("unsupported exit node OS")
 	case "windows", "android":
-		return handleExitNodeDNSQueryWithNetPkg(ctx, nil, resp)
+		return handleExitNodeDNSQueryWithNetPkg(ctx, r.logf, nil, resp)
 	case "darwin":
 		// /etc/resolv.conf is a lie and only says one upstream DNS
 		// but for now that's probably good enough. Later we'll
@@ -386,6 +386,8 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 	}
 }
 
+var debugExitNodeDNSNetPkg = envknob.RegisterBool("TS_DEBUG_EXIT_NODE_DNS_NET_PKG")
+
 // handleExitNodeDNSQueryWithNetPkg takes a DNS query message in q and
 // return a reply (for the ExitDNS DoH service) using the net package's
 // native APIs. This is only used on Windows for now.
@@ -394,7 +396,8 @@ func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from ne
 //
 // response contains the pre-serialized response, which notably
 // includes the original question and its header.
-func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolver, resp *response) (res []byte, err error) {
+func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, logf logger.Logf, resolver *net.Resolver, resp *response) (res []byte, err error) {
+	logf = logger.WithPrefix(logf, "exitNodeDNSQueryWithNetPkg: ")
 	if resp.Question.Class != dns.ClassINET {
 		return nil, errors.New("unsupported class")
 	}
@@ -407,8 +410,15 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 
 	handleError := func(err error) (res []byte, _ error) {
 		if isGoNoSuchHostError(err) {
+			if debugExitNodeDNSNetPkg() {
+				logf(`converting Go "no such host" error to a NXDOMAIN: %v`, err)
+			}
 			resp.Header.RCode = dns.RCodeNameError
 			return marshalResponse(resp)
+		}
+
+		if debugExitNodeDNSNetPkg() {
+			logf("returning error: %v", err)
 		}
 		// TODO: map other errors to RCodeServerFailure?
 		// Or I guess our caller should do that?
@@ -423,16 +433,22 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 		if resp.Question.Type == dns.TypeAAAA {
 			network = "ip6"
 		}
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving %s %q", network, name)
+		}
 		ips, err := r.LookupIP(ctx, network, name)
 		if err != nil {
 			return handleError(err)
 		}
 		for _, stdIP := range ips {
-			if ip, ok := netaddr.FromStdIP(stdIP); ok {
-				resp.IPs = append(resp.IPs, ip)
+			if ip, ok := netip.AddrFromSlice(stdIP); ok {
+				resp.IPs = append(resp.IPs, ip.Unmap())
 			}
 		}
 	case dns.TypeTXT:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving TXT %q", name)
+		}
 		strs, err := r.LookupTXT(ctx, name)
 		if err != nil {
 			return handleError(err)
@@ -444,6 +460,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 			// TODO: is this RCodeFormatError?
 			return nil, errors.New("bogus PTR name")
 		}
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving PTR %q", ipStr)
+		}
 		addrs, err := r.LookupAddr(ctx, ipStr)
 		if err != nil {
 			return handleError(err)
@@ -452,12 +471,18 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 			resp.Name, _ = dnsname.ToFQDN(addrs[0])
 		}
 	case dns.TypeCNAME:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving CNAME %q", name)
+		}
 		cname, err := r.LookupCNAME(ctx, name)
 		if err != nil {
 			return handleError(err)
 		}
 		resp.CNAME = cname
 	case dns.TypeSRV:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving SRV %q", name)
+		}
 		// Thanks, Go: "To accommodate services publishing SRV
 		// records under non-standard names, if both service
 		// and proto are empty strings, LookupSRV looks up
@@ -468,6 +493,9 @@ func handleExitNodeDNSQueryWithNetPkg(ctx context.Context, resolver *net.Resolve
 		}
 		resp.SRVs = srvs
 	case dns.TypeNS:
+		if debugExitNodeDNSNetPkg() {
+			logf("resolving NS %q", name)
+		}
 		nss, err := r.LookupNS(ctx, name)
 		if err != nil {
 			return handleError(err)
@@ -495,7 +523,7 @@ type resolvConfCache struct {
 
 // resolvConfCacheValue contains the most recent stat metadata and parsed
 // version of /etc/resolv.conf.
-var resolvConfCacheValue atomic.Value // of resolvConfCache
+var resolvConfCacheValue syncs.AtomicValue[resolvConfCache]
 
 var errEmptyResolvConf = errors.New("resolv.conf has no nameservers")
 
@@ -510,7 +538,7 @@ func stubResolverForOS() (ip netip.Addr, err error) {
 		mod:  fi.ModTime(),
 		size: fi.Size(),
 	}
-	if c, ok := resolvConfCacheValue.Load().(resolvConfCache); ok && c.mod == cur.mod && c.size == cur.size {
+	if c, ok := resolvConfCacheValue.LoadOk(); ok && c.mod == cur.mod && c.size == cur.size {
 		return c.ip, nil
 	}
 	conf, err := resolvconffile.ParseFile(resolvconffile.Path)
@@ -550,7 +578,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 			return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
 		}
 	}
-	// Special-case: 'via-<siteid>.<ipv4>' queries.
+	// Special-case: 4via6 DNS names.
 	if ip, ok := r.parseViaDomain(domain, typ); ok {
 		return ip, dns.RCodeSuccess
 	}
@@ -609,7 +637,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 		metricDNSResolveLocalOKAll.Add(1)
 		return addrs[0], dns.RCodeSuccess
 
-	// Leave some some record types explicitly unimplemented.
+	// Leave some record types explicitly unimplemented.
 	// These types relate to recursive resolution or special
 	// DNS semantics and might be implemented in the future.
 	case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR, dns.TypeHINFO:
@@ -630,7 +658,9 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 }
 
 // parseViaDomain synthesizes an IP address for quad-A DNS requests of the form
-// `<IPv4-address>.via-<X>` and the deprecated form `via-<X>.<IPv4-address>`,
+// `<IPv4-address-with-hypens-instead-of-dots>-via-<siteid>[.*]`. Two prior formats that
+// didn't pan out (due to a Chrome issue and DNS search ndots issues) were
+// `<IPv4-address>.via-<X>` and the older `via-<X>.<IPv4-address>`,
 // where X is a decimal, or hex-encoded number with a '0x' prefix.
 //
 // This exists as a convenient mapping into Tailscales 'Via Range'.
@@ -650,14 +680,28 @@ func (r *Resolver) parseViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Addr
 
 	var siteID string
 	var ip4Str string
-	if strings.HasPrefix(fqdn, "via-") {
+	switch {
+	case strings.Contains(fqdn, "-via-"):
+		// Format number 3: "192-168-1-2-via-7" or "192-168-1-2-via-7.foo.ts.net."
+		// Third time's a charm. The earlier two formats follow after this block.
+		firstLabel, domain, _ := strings.Cut(fqdn, ".") // "192-168-1-2-via-7"
+		if !(domain == "" || dnsname.HasSuffix(domain, "ts.net") || dnsname.HasSuffix(domain, "tailscale.net")) {
+			return netip.Addr{}, false
+		}
+		v4hyphens, suffix, ok := strings.Cut(firstLabel, "-via-")
+		if !ok {
+			return netip.Addr{}, false
+		}
+		siteID = suffix
+		ip4Str = strings.ReplaceAll(v4hyphens, "-", ".")
+	case strings.HasPrefix(fqdn, "via-"):
 		firstDot := strings.Index(fqdn, ".")
 		if firstDot < 0 {
 			return netip.Addr{}, false // missing dot delimiters
 		}
 		siteID = fqdn[len("via-"):firstDot]
 		ip4Str = fqdn[firstDot+1:]
-	} else {
+	default:
 		lastDot := strings.LastIndex(fqdn, ".")
 		if lastDot < 0 {
 			return netip.Addr{}, false // missing dot delimiters
@@ -672,12 +716,12 @@ func (r *Resolver) parseViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Addr
 
 	ip4, err := netip.ParseAddr(ip4Str)
 	if err != nil {
-		return netip.Addr{}, false // badly formed, dont respond
+		return netip.Addr{}, false // badly formed, don't respond
 	}
 
 	prefix, err := strconv.ParseUint(siteID, 0, 32)
 	if err != nil {
-		return netip.Addr{}, false // badly formed, dont respond
+		return netip.Addr{}, false // badly formed, don't respond
 	}
 
 	// MapVia will never error when given an ipv4 netip.Prefix.
@@ -1025,11 +1069,11 @@ const (
 // https://tools.ietf.org/html/rfc6763 lists
 // "five special RR names" for Bonjour service discovery:
 //
-//   b._dns-sd._udp.<domain>.
-//  db._dns-sd._udp.<domain>.
-//   r._dns-sd._udp.<domain>.
-//  dr._dns-sd._udp.<domain>.
-//  lb._dns-sd._udp.<domain>.
+//	 b._dns-sd._udp.<domain>.
+//	db._dns-sd._udp.<domain>.
+//	 r._dns-sd._udp.<domain>.
+//	dr._dns-sd._udp.<domain>.
+//	lb._dns-sd._udp.<domain>.
 func hasRDNSBonjourPrefix(name dnsname.FQDN) bool {
 	s := name.WithTrailingDot()
 	base, rest, ok := strings.Cut(s, ".")
@@ -1063,9 +1107,12 @@ func rawNameToLower(name []byte) string {
 // ptrNameToIPv4 transforms a PTR name representing an IPv4 address to said address.
 // Such names are IPv4 labels in reverse order followed by .in-addr.arpa.
 // For example,
-//   4.3.2.1.in-addr.arpa
+//
+//	4.3.2.1.in-addr.arpa
+//
 // is transformed to
-//   1.2.3.4
+//
+//	1.2.3.4
 func rdnsNameToIPv4(name dnsname.FQDN) (ip netip.Addr, ok bool) {
 	s := strings.TrimSuffix(name.WithTrailingDot(), rdnsv4Suffix)
 	ip, err := netip.ParseAddr(s)
@@ -1082,9 +1129,12 @@ func rdnsNameToIPv4(name dnsname.FQDN) (ip netip.Addr, ok bool) {
 // ptrNameToIPv6 transforms a PTR name representing an IPv6 address to said address.
 // Such names are dot-separated nibbles in reverse order followed by .ip6.arpa.
 // For example,
-//   b.a.9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.
+//
+//	b.a.9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.
+//
 // is transformed to
-//   2001:db8::567:89ab
+//
+//	2001:db8::567:89ab
 func rdnsNameToIPv6(name dnsname.FQDN) (ip netip.Addr, ok bool) {
 	var b [32]byte
 	var ipb [16]byte
@@ -1118,7 +1168,7 @@ func rdnsNameToIPv6(name dnsname.FQDN) (ip netip.Addr, ok bool) {
 		return netip.Addr{}, false
 	}
 
-	return netaddr.IPFrom16(ipb), true
+	return netip.AddrFrom16(ipb), true
 }
 
 // respondReverse returns a DNS response to a PTR query.
@@ -1193,8 +1243,7 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 // unARPA maps from "4.4.8.8.in-addr.arpa." to "8.8.4.4", etc.
 func unARPA(a string) (ipStr string, ok bool) {
 	const suf4 = ".in-addr.arpa."
-	if strings.HasSuffix(a, suf4) {
-		s := strings.TrimSuffix(a, suf4)
+	if s, ok := strings.CutSuffix(a, suf4); ok {
 		// Parse and reverse octets.
 		ip, err := netip.ParseAddr(s)
 		if err != nil || !ip.Is4() {
@@ -1215,7 +1264,7 @@ func unARPA(a string) (ipStr string, ok bool) {
 			}
 		}
 		hex.Decode(a16[:], hx[:])
-		return netaddr.IPFrom16(a16).String(), true
+		return netip.AddrFrom16(a16).Unmap().String(), true
 	}
 	return "", false
 

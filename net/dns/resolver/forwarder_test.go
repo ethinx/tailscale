@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
-	"tailscale.com/hostinfo"
 	"tailscale.com/types/dnstype"
 )
 
@@ -79,6 +77,16 @@ func TestResolversWithDelays(t *testing.T) {
 			in:   q("9.9.9.9", "2620:fe::fe"),
 			want: o("https://dns.quad9.net/dns-query", "9.9.9.9+0.5s", "2620:fe::fe+0.5s"),
 		},
+		{
+			name: "nextdns-ipv6-expand",
+			in:   q("2a07:a8c0::c3:a884"),
+			want: o("https://dns.nextdns.io/c3a884"),
+		},
+		{
+			name: "nextdns-doh-input",
+			in:   q("https://dns.nextdns.io/c3a884"),
+			want: o("https://dns.nextdns.io/c3a884"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -129,33 +137,6 @@ func TestGetRCode(t *testing.T) {
 			got := getRCode(tt.packet)
 			if got != tt.want {
 				t.Errorf("got %d; want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestMaxDoHInFlight(t *testing.T) {
-	tests := []struct {
-		goos string
-		ver  string
-		want int
-	}{
-		{"ios", "", 10},
-		{"ios", "1532", 10},
-		{"ios", "9.3.2", 10},
-		{"ios", "14.3.2", 10},
-		{"ios", "15.3.2", 1000},
-		{"ios", "20.3.2", 1000},
-		{"android", "", 1000},
-		{"darwin", "", 1000},
-		{"linux", "", 1000},
-	}
-	for _, tc := range tests {
-		t.Run(fmt.Sprintf("%s-%s", tc.goos, tc.ver), func(t *testing.T) {
-			hostinfo.SetOSVersion(tc.ver)
-			got := maxDoHInFlight(tc.goos)
-			if got != tc.want {
-				t.Errorf("got %d; want %d", got, tc.want)
 			}
 		})
 	}

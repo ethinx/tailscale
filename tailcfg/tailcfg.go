@@ -1,12 +1,12 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHPrincipal --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan --clonefunc
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -19,6 +19,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/tkatype"
 	"tailscale.com/util/dnsname"
 )
 
@@ -27,7 +28,8 @@ import (
 // single monotonically increasing integer, rather than the relatively
 // complex x.y.z-xxxxx semver+hash(es). Whenever the client gains a
 // capability or wants to negotiate a change in semantics with the
-// server (control plane), bump this number and document what's new.
+// server (control plane),  peers (over PeerAPI), or frontend (over
+// LocalAPI), bump this number and document what's new.
 //
 // Previously (prior to 2022-03-06), it was known as the "MapRequest
 // version" or "mapVer" or "map cap" and that name and usage persists
@@ -37,38 +39,64 @@ type CapabilityVersion int
 // CurrentCapabilityVersion is the current capability version of the codebase.
 //
 // History of versions:
-//     3: implicit compression, keep-alives
-//     4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
-//     5: 2020-10-19, implies IncludeIPv6, delta Peers/UserProfiles, supports MagicDNS
-//     6: 2020-12-07: means MapResponse.PacketFilter nil means unchanged
-//     7: 2020-12-15: FilterRule.SrcIPs accepts CIDRs+ranges, doesn't warn about 0.0.0.0/::
-//     8: 2020-12-19: client can buggily receive IPv6 addresses and routes if beta enabled server-side
-//     9: 2020-12-30: client doesn't auto-add implicit search domains from peers; only DNSConfig.Domains
-//    10: 2021-01-17: client understands MapResponse.PeerSeenChange
-//    11: 2021-03-03: client understands IPv6, multiple default routes, and goroutine dumping
-//    12: 2021-03-04: client understands PingRequest
-//    13: 2021-03-19: client understands FilterRule.IPProto
-//    14: 2021-04-07: client understands DNSConfig.Routes and DNSConfig.Resolvers
-//    15: 2021-04-12: client treats nil MapResponse.DNSConfig as meaning unchanged
-//    16: 2021-04-15: client understands Node.Online, MapResponse.OnlineChange
-//    17: 2021-04-18: MapResponse.Domain empty means unchanged
-//    18: 2021-04-19: MapResponse.Node nil means unchanged (all fields now omitempty)
-//    19: 2021-04-21: MapResponse.Debug.SleepSeconds
-//    20: 2021-06-11: MapResponse.LastSeen used even less (https://github.com/tailscale/tailscale/issues/2107)
-//    21: 2021-06-15: added MapResponse.DNSConfig.CertDomains
-//    22: 2021-06-16: added MapResponse.DNSConfig.ExtraRecords
-//    23: 2021-08-25: DNSConfig.Routes values may be empty (for ExtraRecords support in 1.14.1+)
-//    24: 2021-09-18: MapResponse.Health from control to node; node shows in "tailscale status"
-//    25: 2021-11-01: MapResponse.Debug.Exit
-//    26: 2022-01-12: (nothing, just bumping for 1.20.0)
-//    27: 2022-02-18: start of SSHPolicy being respected
-//    28: 2022-03-09: client can communicate over Noise.
-//    29: 2022-03-21: MapResponse.PopBrowserURL
-//    30: 2022-03-22: client can request id tokens.
-//    31: 2022-04-15: PingRequest & PingResponse TSMP & disco support
-//    32: 2022-04-17: client knows FilterRule.CapMatch
-//    33: 2022-07-20: added MapResponse.PeersChangedPatch (DERPRegion + Endpoints)
-const CurrentCapabilityVersion CapabilityVersion = 33
+//
+//   - 3: implicit compression, keep-alives
+//   - 4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
+//   - 5: 2020-10-19, implies IncludeIPv6, delta Peers/UserProfiles, supports MagicDNS
+//   - 6: 2020-12-07: means MapResponse.PacketFilter nil means unchanged
+//   - 7: 2020-12-15: FilterRule.SrcIPs accepts CIDRs+ranges, doesn't warn about 0.0.0.0/::
+//   - 8: 2020-12-19: client can buggily receive IPv6 addresses and routes if beta enabled server-side
+//   - 9: 2020-12-30: client doesn't auto-add implicit search domains from peers; only DNSConfig.Domains
+//   - 10: 2021-01-17: client understands MapResponse.PeerSeenChange
+//   - 11: 2021-03-03: client understands IPv6, multiple default routes, and goroutine dumping
+//   - 12: 2021-03-04: client understands PingRequest
+//   - 13: 2021-03-19: client understands FilterRule.IPProto
+//   - 14: 2021-04-07: client understands DNSConfig.Routes and DNSConfig.Resolvers
+//   - 15: 2021-04-12: client treats nil MapResponse.DNSConfig as meaning unchanged
+//   - 16: 2021-04-15: client understands Node.Online, MapResponse.OnlineChange
+//   - 17: 2021-04-18: MapResponse.Domain empty means unchanged
+//   - 18: 2021-04-19: MapResponse.Node nil means unchanged (all fields now omitempty)
+//   - 19: 2021-04-21: MapResponse.Debug.SleepSeconds
+//   - 20: 2021-06-11: MapResponse.LastSeen used even less (https://github.com/tailscale/tailscale/issues/2107)
+//   - 21: 2021-06-15: added MapResponse.DNSConfig.CertDomains
+//   - 22: 2021-06-16: added MapResponse.DNSConfig.ExtraRecords
+//   - 23: 2021-08-25: DNSConfig.Routes values may be empty (for ExtraRecords support in 1.14.1+)
+//   - 24: 2021-09-18: MapResponse.Health from control to node; node shows in "tailscale status"
+//   - 25: 2021-11-01: MapResponse.Debug.Exit
+//   - 26: 2022-01-12: (nothing, just bumping for 1.20.0)
+//   - 27: 2022-02-18: start of SSHPolicy being respected
+//   - 28: 2022-03-09: client can communicate over Noise.
+//   - 29: 2022-03-21: MapResponse.PopBrowserURL
+//   - 30: 2022-03-22: client can request id tokens.
+//   - 31: 2022-04-15: PingRequest & PingResponse TSMP & disco support
+//   - 32: 2022-04-17: client knows FilterRule.CapMatch
+//   - 33: 2022-07-20: added MapResponse.PeersChangedPatch (DERPRegion + Endpoints)
+//   - 34: 2022-08-02: client understands CapabilityFileSharingTarget
+//   - 36: 2022-08-02: added PeersChangedPatch.{Key,DiscoKey,Online,LastSeen,KeyExpiry,Capabilities}
+//   - 37: 2022-08-09: added Debug.{SetForceBackgroundSTUN,SetRandomizeClientPort}; Debug are sticky
+//   - 38: 2022-08-11: added PingRequest.URLIsNoise
+//   - 39: 2022-08-15: clients can talk Noise over arbitrary HTTPS port
+//   - 40: 2022-08-22: added Node.KeySignature, PeersChangedPatch.KeySignature
+//   - 41: 2022-08-30: uses 100.100.100.100 for route-less ExtraRecords if global nameservers is set
+//   - 42: 2022-09-06: NextDNS DoH support; see https://github.com/tailscale/tailscale/pull/5556
+//   - 43: 2022-09-21: clients can return usernames for SSH
+//   - 44: 2022-09-22: MapResponse.ControlDialPlan
+//   - 45: 2022-09-26: c2n /debug/{goroutines,prefs,metrics}
+//   - 46: 2022-10-04: c2n /debug/component-logging
+//   - 47: 2022-10-11: Register{Request,Response}.NodeKeySignature
+//   - 48: 2022-11-02: Node.UnsignedPeerAPIOnly
+//   - 49: 2022-11-03: Client understands EarlyNoise
+//   - 50: 2022-11-14: Client understands CapabilityIngress
+//   - 51: 2022-11-30: Client understands CapabilityTailnetLockAlpha
+//   - 52: 2023-01-05: client can handle c2n POST /logtail/flush
+//   - 53: 2023-01-18: client respects explicit Node.Expired + auto-sets based on Node.KeyExpiry
+//   - 54: 2023-01-19: Node.Cap added, PeersChangedPatch.Cap, uses Node.Cap for ExitDNS before Hostinfo.Services fallback
+//   - 55: 2023-01-23: start of c2n GET+POST /update handler
+//   - 56: 2023-01-24: Client understands CapabilityDebugTSDNSResolution
+//   - 57: 2023-01-25: Client understands CapabilityBindToInterfaceByRoute
+//   - 58: 2023-03-10: Client retries lite map updates before restarting map poll.
+//   - 59: 2023-03-16: Client understands Peers[].SelfNodeV4MasqAddrForThisPeer
+const CurrentCapabilityVersion CapabilityVersion = 59
 
 type StableID string
 
@@ -103,7 +131,7 @@ func (u StableNodeID) IsZero() bool {
 // A user can have multiple logins associated with it (e.g. gmail and github oauth).
 // (Note: none of our UIs support this yet.)
 //
-// Some properties are inhereted from the logins and can be overridden, such as
+// Some properties are inherited from the logins and can be overridden, such as
 // display name and profile picture.
 //
 // Other properties must be the same for all logins associated with a user.
@@ -156,7 +184,12 @@ func (emptyStructJSONSlice) UnmarshalJSON([]byte) error { return nil }
 type Node struct {
 	ID       NodeID
 	StableID StableNodeID
-	Name     string // DNS
+
+	// Name is the FQDN of the node.
+	// It is also the MagicDNS name for the node.
+	// It has a trailing dot.
+	// e.g. "host.tail-scale.ts.net."
+	Name string
 
 	// User is the user who created the node. If ACL tags are in
 	// use for the node then it doesn't reflect the ACL identity
@@ -166,16 +199,18 @@ type Node struct {
 	// Sharer, if non-zero, is the user who shared this node, if different than User.
 	Sharer UserID `json:",omitempty"`
 
-	Key        key.NodePublic
-	KeyExpiry  time.Time
-	Machine    key.MachinePublic
-	DiscoKey   key.DiscoPublic
-	Addresses  []netip.Prefix // IP addresses of this Node directly
-	AllowedIPs []netip.Prefix // range of IP addresses to route to this node
-	Endpoints  []string       `json:",omitempty"` // IP+port (public via STUN, and local LANs)
-	DERP       string         `json:",omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
-	Hostinfo   HostinfoView
-	Created    time.Time
+	Key          key.NodePublic
+	KeyExpiry    time.Time                  // the zero value if this node does not expire
+	KeySignature tkatype.MarshaledSignature `json:",omitempty"`
+	Machine      key.MachinePublic
+	DiscoKey     key.DiscoPublic
+	Addresses    []netip.Prefix // IP addresses of this Node directly
+	AllowedIPs   []netip.Prefix // range of IP addresses to route to this node
+	Endpoints    []string       `json:",omitempty"` // IP+port (public via STUN, and local LANs)
+	DERP         string         `json:",omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
+	Hostinfo     HostinfoView
+	Created      time.Time
+	Cap          CapabilityVersion `json:",omitempty"` // if non-zero, the node's capability version; old servers might not send
 
 	// Tags are the list of ACL tags applied to this node.
 	// Tags take the form of `tag:<value>` where value starts
@@ -214,6 +249,14 @@ type Node struct {
 	//    "https://tailscale.com/cap/file-sharing"
 	Capabilities []string `json:",omitempty"`
 
+	// UnsignedPeerAPIOnly means that this node is not signed nor subject to TKA
+	// restrictions. However, in exchange for that privilege, it does not get
+	// network access. It can only access this node's peerapi, which may not let
+	// it do anything. It is the tailscaled client's job to double-check the
+	// MapResponse's PacketFilter to verify that its AllowedIPs will not be
+	// accepted by the packet filter.
+	UnsignedPeerAPIOnly bool `json:",omitempty"`
+
 	// The following three computed fields hold the various names that can
 	// be used for this node in UIs. They are populated from controlclient
 	// (not from control) by calling node.InitDisplayNames. These can be
@@ -222,6 +265,30 @@ type Node struct {
 	ComputedName            string `json:",omitempty"` // MagicDNS base name (for normal non-shared-in nodes), FQDN (without trailing dot, for shared-in nodes), or Hostname (if no MagicDNS)
 	computedHostIfDifferent string // hostname, if different than ComputedName, otherwise empty
 	ComputedNameWithHost    string `json:",omitempty"` // either "ComputedName" or "ComputedName (computedHostIfDifferent)", if computedHostIfDifferent is set
+
+	// DataPlaneAuditLogID is the per-node logtail ID used for data plane audit logging.
+	DataPlaneAuditLogID string `json:",omitempty"`
+
+	// Expired is whether this node's key has expired. Control may send
+	// this; clients are only allowed to set this from false to true. On
+	// the client, this is calculated client-side based on a timestamp sent
+	// from control, to avoid clock skew issues.
+	Expired bool `json:",omitempty"`
+
+	// SelfNodeV4MasqAddrForThisPeer is the IPv4 that this peer knows the current node as.
+	// It may be empty if the peer knows the current node by its native
+	// IPv4 address.
+	// This field is only populated in a MapResponse for peers and not
+	// for the current node.
+	//
+	// If set, it should be used to masquerade traffic originating from the
+	// current node to this peer. The masquerade address is only relevant
+	// for this peer and not for other peers.
+	//
+	// This only applies to traffic originating from the current node to the
+	// peer or any of its subnets. Traffic originating from subnet routes will
+	// not be masqueraded (e.g. in case of --snat-subnet-routes).
+	SelfNodeV4MasqAddrForThisPeer netip.Addr `json:",omitempty"`
 }
 
 // DisplayName returns the user-facing name for a node which should
@@ -231,7 +298,7 @@ type Node struct {
 // the owner of the node. When forOwner is false, the hostname is
 // never included in the return value.
 //
-// Return value is either either "Name" or "Name (Hostname)", where
+// Return value is either "Name" or "Name (Hostname)", where
 // Name is the node's MagicDNS base name (for normal non-shared-in
 // nodes), FQDN (without trailing dot, for shared-in nodes), or
 // Hostname (if no MagicDNS). Hostname is only included in the
@@ -266,6 +333,11 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 		return n.ComputedName, n.computedHostIfDifferent
 	}
 	return n.ComputedName, ""
+}
+
+// IsTagged reports whether the node has any tags.
+func (n *Node) IsTagged() bool {
+	return len(n.Tags) > 0
 }
 
 // InitDisplayNames computes and populates n's display name
@@ -454,24 +526,54 @@ type Service struct {
 // Because it contains pointers (slices), this type should not be used
 // as a value type.
 type Hostinfo struct {
-	IPNVersion    string         `json:",omitempty"` // version of this code
-	FrontendLogID string         `json:",omitempty"` // logtail ID of frontend instance
-	BackendLogID  string         `json:",omitempty"` // logtail ID of backend instance
-	OS            string         `json:",omitempty"` // operating system the client runs on (a version.OS value)
-	OSVersion     string         `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
-	Desktop       opt.Bool       `json:",omitempty"` // if a desktop was detected on Linux
-	Package       string         `json:",omitempty"` // Tailscale package to disambiguate ("choco", "appstore", etc; "" for unknown)
-	DeviceModel   string         `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone12,3")
-	Hostname      string         `json:",omitempty"` // name of the host the client runs on
-	ShieldsUp     bool           `json:",omitempty"` // indicates whether the host is blocking incoming connections
-	ShareeNode    bool           `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
-	GoArch        string         `json:",omitempty"` // the host's GOARCH value (of the running binary)
-	RoutableIPs   []netip.Prefix `json:",omitempty"` // set of IP ranges this client can route
-	RequestTags   []string       `json:",omitempty"` // set of ACL tags this node wants to claim
-	Services      []Service      `json:",omitempty"` // services advertised by this machine
-	NetInfo       *NetInfo       `json:",omitempty"`
-	SSH_HostKeys  []string       `json:"sshHostKeys,omitempty"` // if advertised
-	Cloud         string         `json:",omitempty"`
+	IPNVersion    string `json:",omitempty"` // version of this code (in version.Long format)
+	FrontendLogID string `json:",omitempty"` // logtail ID of frontend instance
+	BackendLogID  string `json:",omitempty"` // logtail ID of backend instance
+	OS            string `json:",omitempty"` // operating system the client runs on (a version.OS value)
+
+	// OSVersion is the version of the OS, if available.
+	//
+	// For Android, it's like "10", "11", "12", etc. For iOS and macOS it's like
+	// "15.6.1" or "12.4.0". For Windows it's like "10.0.19044.1889". For
+	// FreeBSD it's like "12.3-STABLE".
+	//
+	// For Linux, prior to Tailscale 1.32, we jammed a bunch of fields into this
+	// string on Linux, like "Debian 10.4; kernel=xxx; container; env=kn" and so
+	// on. As of Tailscale 1.32, this is simply the kernel version on Linux, like
+	// "5.10.0-17-amd64".
+	OSVersion string `json:",omitempty"`
+
+	Container      opt.Bool `json:",omitempty"` // whether the client is running in a container
+	Env            string   `json:",omitempty"` // a hostinfo.EnvType in string form
+	Distro         string   `json:",omitempty"` // "debian", "ubuntu", "nixos", ...
+	DistroVersion  string   `json:",omitempty"` // "20.04", ...
+	DistroCodeName string   `json:",omitempty"` // "jammy", "bullseye", ...
+
+	// App is used to disambiguate Tailscale clients that run using tsnet.
+	App string `json:",omitempty"` // "k8s-operator", "golinks", ...
+
+	Desktop         opt.Bool       `json:",omitempty"` // if a desktop was detected on Linux
+	Package         string         `json:",omitempty"` // Tailscale package to disambiguate ("choco", "appstore", etc; "" for unknown)
+	DeviceModel     string         `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone12,3")
+	PushDeviceToken string         `json:",omitempty"` // macOS/iOS APNs device token for notifications (and Android in the future)
+	Hostname        string         `json:",omitempty"` // name of the host the client runs on
+	ShieldsUp       bool           `json:",omitempty"` // indicates whether the host is blocking incoming connections
+	ShareeNode      bool           `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
+	NoLogsNoSupport bool           `json:",omitempty"` // indicates that the user has opted out of sending logs and support
+	WireIngress     bool           `json:",omitempty"` // indicates that the node wants the option to receive ingress connections
+	AllowsUpdate    bool           `json:",omitempty"` // indicates that the node has opted-in to admin-console-drive remote updates
+	Machine         string         `json:",omitempty"` // the current host's machine type (uname -m)
+	GoArch          string         `json:",omitempty"` // GOARCH value (of the built binary)
+	GoArchVar       string         `json:",omitempty"` // GOARM, GOAMD64, etc (of the built binary)
+	GoVersion       string         `json:",omitempty"` // Go version binary was built with
+	RoutableIPs     []netip.Prefix `json:",omitempty"` // set of IP ranges this client can route
+	RequestTags     []string       `json:",omitempty"` // set of ACL tags this node wants to claim
+	Services        []Service      `json:",omitempty"` // services advertised by this machine
+	NetInfo         *NetInfo       `json:",omitempty"`
+	SSH_HostKeys    []string       `json:"sshHostKeys,omitempty"` // if advertised
+	Cloud           string         `json:",omitempty"`
+	Userspace       opt.Bool       `json:",omitempty"` // if the client is running in userspace (netstack) mode
+	UserspaceRouter opt.Bool       `json:",omitempty"` // if the client's subnet router is running in userspace (netstack) mode
 
 	// NOTE: any new fields containing pointers in this type
 	//       require changes to Hostinfo.Equal.
@@ -486,6 +588,14 @@ func (hi *Hostinfo) TailscaleSSHEnabled() bool {
 }
 
 func (v HostinfoView) TailscaleSSHEnabled() bool { return v.ж.TailscaleSSHEnabled() }
+
+// TailscaleFunnelEnabled reports whether or not this node has explicitly
+// enabled Funnel.
+func (hi *Hostinfo) TailscaleFunnelEnabled() bool {
+	return hi != nil && hi.WireIngress
+}
+
+func (v HostinfoView) TailscaleFunnelEnabled() bool { return v.ж.TailscaleFunnelEnabled() }
 
 // NetInfo contains information about the host's network state.
 type NetInfo struct {
@@ -506,6 +616,10 @@ type NetInfo struct {
 
 	// WorkingUDP is whether the host has UDP internet connectivity.
 	WorkingUDP opt.Bool
+
+	// WorkingICMPv4 is whether ICMPv4 works.
+	// Empty means not checked.
+	WorkingICMPv4 opt.Bool
 
 	// HavePortMap is whether we have an existing portmap open
 	// (UPnP, PMP, or PCP).
@@ -551,11 +665,10 @@ func (ni *NetInfo) String() string {
 	if ni == nil {
 		return "NetInfo(nil)"
 	}
-	return fmt.Sprintf("NetInfo{varies=%v hairpin=%v ipv6=%v udp=%v derp=#%v portmap=%v link=%q}",
+	return fmt.Sprintf("NetInfo{varies=%v hairpin=%v ipv6=%v ipv6os=%v udp=%v icmpv4=%v derp=#%v portmap=%v link=%q}",
 		ni.MappingVariesByDestIP, ni.HairPinning, ni.WorkingIPv6,
-		ni.WorkingUDP, ni.PreferredDERP,
-		ni.portMapSummary(),
-		ni.LinkType)
+		ni.OSHasIPv6, ni.WorkingUDP, ni.WorkingICMPv4,
+		ni.PreferredDERP, ni.portMapSummary(), ni.LinkType)
 }
 
 func (ni *NetInfo) portMapSummary() string {
@@ -597,6 +710,7 @@ func (ni *NetInfo) BasicallyEqual(ni2 *NetInfo) bool {
 		ni.WorkingIPv6 == ni2.WorkingIPv6 &&
 		ni.OSHasIPv6 == ni2.OSHasIPv6 &&
 		ni.WorkingUDP == ni2.WorkingUDP &&
+		ni.WorkingICMPv4 == ni2.WorkingICMPv4 &&
 		ni.HavePortMap == ni2.HavePortMap &&
 		ni.UPnP == ni2.UPnP &&
 		ni.PMP == ni2.PMP &&
@@ -746,6 +860,7 @@ func (st SignatureType) String() string {
 // RegisterRequest is sent by a client to register the key for a node.
 // It is encoded to JSON, encrypted with golang.org/x/crypto/nacl/box,
 // using the local machine key, and sent to:
+//
 //	https://login.tailscale.com/machine/<mkey hex>
 type RegisterRequest struct {
 	_ structs.Incomparable
@@ -759,6 +874,7 @@ type RegisterRequest struct {
 
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
+	NLKey      key.NLPublic
 	Auth       struct {
 		_ structs.Incomparable
 		// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
@@ -778,6 +894,13 @@ type RegisterRequest struct {
 	// node be considered ephemeral and be automatically deleted
 	// when it stops being active.
 	Ephemeral bool `json:",omitempty"`
+
+	// NodeKeySignature is the node's own node-key signature, re-signed
+	// for its new node key using its network-lock key.
+	//
+	// This field is set when the client retries registration after learning
+	// its NodeKeySignature (which is in need of rotation).
+	NodeKeySignature tkatype.MarshaledSignature
 
 	// The following fields are not used for SignatureNone and are required for
 	// SignatureV1:
@@ -806,6 +929,7 @@ func (req *RegisterRequest) Clone() *RegisterRequest {
 	}
 	res.DeviceCert = append(res.DeviceCert[:0:0], res.DeviceCert...)
 	res.Signature = append(res.Signature[:0:0], res.Signature...)
+	res.NodeKeySignature = append(res.NodeKeySignature[:0:0], res.NodeKeySignature...)
 	return res
 }
 
@@ -817,7 +941,11 @@ type RegisterResponse struct {
 	MachineAuthorized bool   // TODO(crawshaw): move to using MachineStatus
 	AuthURL           string // if set, authorization pending
 
-	// Error indiciates that authorization failed. If this is non-empty,
+	// If set, this is the current node-key signature that needs to be
+	// re-signed for the node's new node-key.
+	NodeKeySignature tkatype.MarshaledSignature
+
+	// Error indicates that authorization failed. If this is non-empty,
 	// other status fields should be ignored.
 	Error string
 }
@@ -864,6 +992,7 @@ type Endpoint struct {
 //
 // The request is encoded to JSON, encrypted with golang.org/x/crypto/nacl/box,
 // using the local machine key, and sent to:
+//
 //	https://login.tailscale.com/machine/<mkey hex>/map
 type MapRequest struct {
 	// Version is incremented whenever the client code changes enough that
@@ -881,10 +1010,34 @@ type MapRequest struct {
 	Stream      bool // if true, multiple MapResponse objects are returned
 	Hostinfo    *Hostinfo
 
+	// MapSessionHandle, if non-empty, is a request to reattach to a previous
+	// map session after a previous map session was interrupted for whatever
+	// reason. Its value is an opaque string as returned by
+	// MapResponse.MapSessionHandle.
+	//
+	// When set, the client must also send MapSessionSeq to specify the last
+	// processed message in that prior session.
+	//
+	// The server may choose to ignore the request for any reason and start a
+	// new map session. This is only applicable when Stream is true.
+	MapSessionHandle string `json:",omitempty"`
+
+	// MapSessionSeq is the sequence number in the map session identified by
+	// MapSesssionHandle that was most recently processed by the client.
+	// It is only applicable when MapSessionHandle is specified.
+	// If the server chooses to honor the MapSessionHandle request, only sequence
+	// numbers greater than this value will be returned.
+	MapSessionSeq int64 `json:",omitempty"`
+
 	// Endpoints are the client's magicsock UDP ip:port endpoints (IPv4 or IPv6).
 	Endpoints []string
 	// EndpointTypes are the types of the corresponding endpoints in Endpoints.
 	EndpointTypes []EndpointType `json:",omitempty"`
+
+	// TKAHead describes the hash of the latest AUM applied to the local
+	// tailnet key authority, if one is operating.
+	// It is encoded as tka.AUMHash.MarshalText.
+	TKAHead string `json:",omitempty"`
 
 	// ReadOnly is whether the client just wants to fetch the
 	// MapResponse, without updating their Endpoints. The
@@ -932,6 +1085,11 @@ type PortRange struct {
 	Last  uint16
 }
 
+// Contains reports whether port is in pr.
+func (pr PortRange) Contains(port uint16) bool {
+	return port >= pr.First && port <= pr.Last
+}
+
 var PortRangeAny = PortRange{0, 65535}
 
 // NetPortRange represents a range of ports that's allowed for one or more IPs.
@@ -944,7 +1102,7 @@ type NetPortRange struct {
 
 // CapGrant grants capabilities in a FilterRule.
 type CapGrant struct {
-	// Dsts are the destination IP ranges that this capabilty
+	// Dsts are the destination IP ranges that this capability
 	// grant matches.
 	Dsts []netip.Prefix
 
@@ -958,7 +1116,7 @@ type CapGrant struct {
 //
 // A rule is logically a set of source CIDRs to match (described by
 // SrcIPs and SrcBits), and a set of destination targets that are then
-// allowed if a source IP is mathces of those CIDRs.
+// allowed if a source IP is matches of those CIDRs.
 type FilterRule struct {
 	// SrcIPs are the source IPs/networks to match.
 	//
@@ -1061,9 +1219,6 @@ type DNSConfig struct {
 	// Nameservers are the IP addresses of the nameservers to use.
 	Nameservers []netip.Addr `json:",omitempty"`
 
-	// PerDomain is not set by the control server, and does nothing.
-	PerDomain bool `json:",omitempty"`
-
 	// CertDomains are the set of DNS names for which the control
 	// plane server will assist with provisioning TLS
 	// certificates. See SetDNSRequest, which can be used to
@@ -1076,7 +1231,7 @@ type DNSConfig struct {
 	// MagicDNS config.
 	ExtraRecords []DNSRecord `json:",omitempty"`
 
-	// ExitNodeFilteredSuffixes are the the DNS suffixes that the
+	// ExitNodeFilteredSuffixes are the DNS suffixes that the
 	// node, when being an exit node DNS proxy, should not answer.
 	//
 	// The entries do not contain trailing periods and are always
@@ -1131,13 +1286,20 @@ const (
 // PingRequest with Types and IP, will send a ping to the IP and send a POST
 // request containing a PingResponse to the URL containing results.
 type PingRequest struct {
-	// URL is the URL to send a HEAD request to.
+	// URL is the URL to reply to the PingRequest to.
 	// It will be a unique URL each time. No auth headers are necessary.
-	//
 	// If the client sees multiple PingRequests with the same URL,
 	// subsequent ones should be ignored.
-	// If Types and IP are defined, then URL is the URL to send a POST request to.
+	//
+	// The HTTP method that the node should make back to URL depends on the other
+	// fields of the PingRequest. If Types is defined, then URL is the URL to
+	// send a POST request to. Otherwise, the node should just make a HEAD
+	// request to URL.
 	URL string
+
+	// URLIsNoise, if true, means that the client should hit URL over the Noise
+	// transport instead of TLS.
+	URLIsNoise bool `json:",omitempty"`
 
 	// Log is whether to log about this ping in the success case.
 	// For failure cases, the client will log regardless.
@@ -1145,11 +1307,22 @@ type PingRequest struct {
 
 	// Types is the types of ping that are initiated. Can be any PingType, comma
 	// separated, e.g. "disco,TSMP"
-	Types string
+	//
+	// As a special case, if Types is "c2n", then this PingRequest is a
+	// client-to-node HTTP request. The HTTP request should be handled by this
+	// node's c2n handler and the HTTP response sent in a POST to URL. For c2n,
+	// the value of URLIsNoise is ignored and only the Noise transport (back to
+	// the control plane) will be used, as if URLIsNoise were true.
+	Types string `json:",omitempty"`
 
-	// IP is the ping target.
-	// It is used in TSMP pings, if IP is invalid or empty then do a HEAD request to the URL.
+	// IP is the ping target, when needed by the PingType(s) given in Types.
 	IP netip.Addr
+
+	// Payload is the ping payload.
+	//
+	// It is only used for c2n requests, in which case it's an HTTP/1.0 or
+	// HTTP/1.1-formatted HTTP request as parsable with http.ReadRequest.
+	Payload []byte `json:",omitempty"`
 }
 
 // PingResponse provides result information for a TSMP or Disco PingRequest.
@@ -1195,6 +1368,20 @@ type PingResponse struct {
 }
 
 type MapResponse struct {
+	// MapSessionHandle optionally specifies a unique opaque handle for this
+	// stateful MapResponse session. Servers may choose not to send it, and it's
+	// only sent on the first MapResponse in a stream. The client can determine
+	// whether it's reattaching to a prior stream by seeing whether this value
+	// matches the requested MapRequest.MapSessionHandle.
+	MapSessionHandle string `json:",omitempty"`
+
+	// Seq is a sequence number within a named map session (a response where the
+	// first message contains a MapSessionHandle). The Seq number may be omitted
+	// on responses that don't change the state of the stream, such as KeepAlive
+	// or certain types of PingRequests. This is the value to be sent in
+	// MapRequest.MapSessionSeq to resume after this message.
+	Seq int64 `json:",omitempty"`
+
 	// KeepAlive, if set, represents an empty message just to keep
 	// the connection alive. When true, all other fields except
 	// PingRequest, ControlTime, and PopBrowserURL are ignored.
@@ -1302,9 +1489,91 @@ type MapResponse struct {
 	// ControlTime, if non-zero, is the current timestamp according to the control server.
 	ControlTime *time.Time `json:",omitempty"`
 
+	// TKAInfo describes the control plane's view of tailnet
+	// key authority (TKA) state.
+	//
+	// An initial nil TKAInfo indicates that the control plane
+	// believes TKA should not be enabled. An initial non-nil TKAInfo
+	// indicates the control plane believes TKA should be enabled.
+	// A nil TKAInfo in a mapresponse stream (i.e. a 'delta' mapresponse)
+	// indicates no change from the value sent earlier.
+	TKAInfo *TKAInfo `json:",omitempty"`
+
+	// DomainDataPlaneAuditLogID, if non-empty, is the per-tailnet log ID to be
+	// used when writing data plane audit logs.
+	DomainDataPlaneAuditLogID string `json:",omitempty"`
+
 	// Debug is normally nil, except for when the control server
 	// is setting debug settings on a node.
 	Debug *Debug `json:",omitempty"`
+
+	// ControlDialPlan tells the client how to connect to the control
+	// server. An initial nil is equivalent to new(ControlDialPlan).
+	// A subsequent streamed nil means no change.
+	ControlDialPlan *ControlDialPlan `json:",omitempty"`
+
+	// ClientVersion describes the latest client version that's available for
+	// download and whether the client is using it. A nil value means no change
+	// or nothing to report.
+	ClientVersion *ClientVersion `json:",omitempty"`
+}
+
+// ClientVersion is information about the latest client version that's available
+// for the client (and whether they're already running it).
+//
+// It does not include a URL to download the client, as that varies by platform.
+type ClientVersion struct {
+	// RunningLatest is true if the client is running the latest build.
+	RunningLatest bool `json:",omitempty"`
+
+	// LatestVersion is the latest version.Short ("1.34.2") version available
+	// for download for the client's platform and packaging type.
+	// It won't be populated if RunningLatest is true.
+	// The primary purpose of the LatestVersion value is to invalidate the client's
+	// cache update check value, if any. This primarily applies to Windows.
+	LatestVersion string `json:",omitempty"`
+
+	// Notify is whether the client should do an OS-specific notification about
+	// a new version being available. This should not be populated if
+	// RunningLatest is true. The client should not notify multiple times for
+	// the same LatestVersion value.
+	Notify bool `json:",omitempty"`
+
+	// NotifyURL is a URL to open in the browser when the user clicks on the
+	// notification, when Notify is true.
+	NotifyURL string `json:",omitempty"`
+
+	// NotifyText is the text to show in the notification, when Notify is true.
+	NotifyText string `json:",omitempty"`
+}
+
+// ControlDialPlan is instructions from the control server to the client on how
+// to connect to the control server; this is useful for maintaining connection
+// if the client's network state changes after the initial connection, or due
+// to the configuration that the control server pushes.
+type ControlDialPlan struct {
+	// An empty list means the default: use DNS (unspecified which DNS).
+	Candidates []ControlIPCandidate
+}
+
+// ControlIPCandidate represents a single candidate address to use when
+// connecting to the control server.
+type ControlIPCandidate struct {
+	// IP is the address to attempt connecting to.
+	IP netip.Addr
+
+	// DialStartSec is the number of seconds after the beginning of the
+	// connection process to wait before trying this candidate.
+	DialStartDelaySec float64 `json:",omitempty"`
+
+	// DialTimeoutSec is the timeout for a connection to this candidate,
+	// starting after DialStartDelaySec.
+	DialTimeoutSec float64 `json:",omitempty"`
+
+	// Priority is the relative priority of this candidate; candidates with
+	// a higher priority are preferred over candidates with a lower
+	// priority.
+	Priority int `json:",omitempty"`
 }
 
 // Debug are instructions from the control server to the client
@@ -1323,6 +1592,15 @@ type Debug struct {
 	// always do its background STUN queries (see magicsock's
 	// periodicReSTUN), regardless of inactivity.
 	ForceBackgroundSTUN bool `json:",omitempty"`
+
+	// SetForceBackgroundSTUN controls whether magicsock should always do its
+	// background STUN queries (see magicsock's periodicReSTUN), regardless of
+	// inactivity.
+	//
+	// As of capver 37, this field is the preferred field for control to set on
+	// the wire and ForceBackgroundSTUN is only used within the code as the
+	// current map session value. But ForceBackgroundSTUN can still be used too.
+	SetForceBackgroundSTUN opt.Bool `json:",omitempty"`
 
 	// DERPRoute controls whether the DERP reverse path
 	// optimization (see Issue 150) should be enabled or
@@ -1354,6 +1632,14 @@ type Debug struct {
 	// fixed port.
 	RandomizeClientPort bool `json:",omitempty"`
 
+	// SetRandomizeClientPort is whether magicsock should UDP bind to :0 to get
+	// a random local port, ignoring any configured fixed port.
+	//
+	// As of capver 37, this field is the preferred field for control to set on
+	// the wire and RandomizeClientPort is only used within the code as the
+	// current map session value. But RandomizeClientPort can still be used too.
+	SetRandomizeClientPort opt.Bool `json:",omitempty"`
+
 	// OneCGNATRoute controls whether the client should prefer to make one
 	// big CGNAT /10 route rather than a /32 per peer.
 	OneCGNATRoute opt.Bool `json:",omitempty"`
@@ -1368,6 +1654,10 @@ type Debug struct {
 	// DisableLogTail disables the logtail package. Once disabled it can't be
 	// re-enabled for the lifetime of the process.
 	DisableLogTail bool `json:",omitempty"`
+
+	// EnableSilentDisco disables the use of heartBeatTimer in magicsock and attempts to
+	// handle disco silently. See issue #540 for details.
+	EnableSilentDisco bool `json:",omitempty"`
 
 	// Exit optionally specifies that the client should os.Exit
 	// with this code.
@@ -1402,8 +1692,10 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.Name == n2.Name &&
 		n.User == n2.User &&
 		n.Sharer == n2.Sharer &&
+		n.UnsignedPeerAPIOnly == n2.UnsignedPeerAPIOnly &&
 		n.Key == n2.Key &&
 		n.KeyExpiry.Equal(n2.KeyExpiry) &&
+		bytes.Equal(n.KeySignature, n2.KeySignature) &&
 		n.Machine == n2.Machine &&
 		n.DiscoKey == n2.DiscoKey &&
 		eqBoolPtr(n.Online, n2.Online) &&
@@ -1412,6 +1704,7 @@ func (n *Node) Equal(n2 *Node) bool {
 		eqCIDRs(n.PrimaryRoutes, n2.PrimaryRoutes) &&
 		eqStrings(n.Endpoints, n2.Endpoints) &&
 		n.DERP == n2.DERP &&
+		n.Cap == n2.Cap &&
 		n.Hostinfo.Equal(n2.Hostinfo) &&
 		n.Created.Equal(n2.Created) &&
 		eqTimePtr(n.LastSeen, n2.LastSeen) &&
@@ -1420,7 +1713,9 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.ComputedName == n2.ComputedName &&
 		n.computedHostIfDifferent == n2.computedHostIfDifferent &&
 		n.ComputedNameWithHost == n2.ComputedNameWithHost &&
-		eqStrings(n.Tags, n2.Tags)
+		eqStrings(n.Tags, n2.Tags) &&
+		n.Expired == n2.Expired &&
+		n.SelfNodeV4MasqAddrForThisPeer == n2.SelfNodeV4MasqAddrForThisPeer
 }
 
 func eqBoolPtr(a, b *bool) bool {
@@ -1488,15 +1783,46 @@ type Oauth2Token struct {
 }
 
 const (
-	// MapResponse.Node self capabilities.
+	// These are the capabilities that the self node has as listed in
+	// MapResponse.Node.Capabilities.
+	//
+	// We've since started referring to these as "Node Attributes" ("nodeAttrs"
+	// in the ACL policy file).
 
-	CapabilityFileSharing = "https://tailscale.com/cap/file-sharing"
-	CapabilityAdmin       = "https://tailscale.com/cap/is-admin"
-	CapabilitySSH         = "https://tailscale.com/cap/ssh"         // feature enabled/available
-	CapabilitySSHRuleIn   = "https://tailscale.com/cap/ssh-rule-in" // some SSH rule reach this node
+	CapabilityFileSharing        = "https://tailscale.com/cap/file-sharing"
+	CapabilityAdmin              = "https://tailscale.com/cap/is-admin"
+	CapabilitySSH                = "https://tailscale.com/cap/ssh"                   // feature enabled/available
+	CapabilitySSHRuleIn          = "https://tailscale.com/cap/ssh-rule-in"           // some SSH rule reach this node
+	CapabilityDataPlaneAuditLogs = "https://tailscale.com/cap/data-plane-audit-logs" // feature enabled
+	CapabilityDebug              = "https://tailscale.com/cap/debug"                 // exposes debug endpoints over the PeerAPI
 
-	// Inter-node capabilities.
+	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
+	// sockets (in the net/netns package). See that package for more
+	// details on the behaviour of this capability.
+	CapabilityBindToInterfaceByRoute = "https://tailscale.com/cap/bind-to-interface-by-route"
 
+	// CapabilityDebugDisableAlternateDefaultRouteInterface changes how Darwin
+	// nodes get the default interface. There is an optional hook (used by the
+	// macOS and iOS clients) to override the default interface, this capability
+	// disables that and uses the default behavior (of parsing the routing
+	// table).
+	CapabilityDebugDisableAlternateDefaultRouteInterface = "https://tailscale.com/cap/debug-disable-alternate-default-route-interface"
+
+	// CapabilityDebugDisableBindConnToInterface disables the automatic binding
+	// of connections to the default network interface on Darwin nodes.
+	CapabilityDebugDisableBindConnToInterface = "https://tailscale.com/cap/debug-disable-bind-conn-to-interface"
+
+	// CapabilityTailnetLockAlpha indicates the node is in the tailnet lock alpha,
+	// and initialization of tailnet lock may proceed.
+	//
+	// TODO(tom): Remove this for 1.35 and later.
+	CapabilityTailnetLockAlpha = "https://tailscale.com/cap/tailnet-lock-alpha"
+
+	// Inter-node capabilities as specified in the MapResponse.PacketFilter[].CapGrants.
+
+	// CapabilityFileSharingTarget grants the current node the ability to send
+	// files to the peer which has this capability.
+	CapabilityFileSharingTarget = "https://tailscale.com/cap/file-sharing-target"
 	// CapabilityFileSharingSend grants the ability to receive files from a
 	// node that's owned by a different user.
 	CapabilityFileSharingSend = "https://tailscale.com/cap/file-send"
@@ -1505,6 +1831,40 @@ const (
 	CapabilityDebugPeer = "https://tailscale.com/cap/debug-peer"
 	// CapabilityWakeOnLAN grants the ability to send a Wake-On-LAN packet.
 	CapabilityWakeOnLAN = "https://tailscale.com/cap/wake-on-lan"
+	// CapabilityIngress grants the ability for a peer to send ingress traffic.
+	CapabilityIngress = "https://tailscale.com/cap/ingress"
+	// CapabilitySSHSessionHaul grants the ability to receive SSH session logs
+	// from a peer.
+	CapabilitySSHSessionHaul = "https://tailscale.com/cap/ssh-session-haul"
+
+	// Funnel warning capabilities used for reporting errors to the user.
+
+	// CapabilityWarnFunnelNoInvite indicates whether Funnel is enabled for the tailnet.
+	// NOTE: In transition from Alpha to Beta, this capability is being reused as the enablement.
+	CapabilityWarnFunnelNoInvite = "https://tailscale.com/cap/warn-funnel-no-invite"
+
+	// CapabilityWarnFunnelNoHTTPS indicates HTTPS has not been enabled for the tailnet.
+	CapabilityWarnFunnelNoHTTPS = "https://tailscale.com/cap/warn-funnel-no-https"
+
+	// Debug logging capabilities
+
+	// CapabilityDebugTSDNSResolution enables verbose debug logging for DNS
+	// resolution for Tailscale-controlled domains (the control server, log
+	// server, DERP servers, etc.)
+	CapabilityDebugTSDNSResolution = "https://tailscale.com/cap/debug-ts-dns-resolution"
+
+	// CapabilityFunnelPorts specifies the ports that the Funnel is available on.
+	// The ports are specified as a comma-separated list of port numbers or port
+	// ranges (e.g. "80,443,8080-8090") in the ports query parameter.
+	// e.g. https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090
+	CapabilityFunnelPorts = "https://tailscale.com/cap/funnel-ports"
+)
+
+const (
+	// NodeAttrFunnel grants the ability for a node to host ingress traffic.
+	NodeAttrFunnel = "funnel"
+	// NodeAttrSSHAggregator grants the ability for a node to collect SSH sessions.
+	NodeAttrSSHAggregator = "ssh-aggregator"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -1514,6 +1874,7 @@ const (
 //
 // The request is encoded to JSON, encrypted with golang.org/x/crypto/nacl/box,
 // using the local machine key, and sent to:
+//
 //	https://login.tailscale.com/machine/<mkey hex>/set-dns
 type SetDNSRequest struct {
 	// Version is the client's capabilities
@@ -1542,6 +1903,13 @@ type SetDNSRequest struct {
 
 // SetDNSResponse is the response to a SetDNSRequest.
 type SetDNSResponse struct{}
+
+// HealthChangeRequest is the JSON request body type used to report
+// node health changes to https://<control>/machine/<mkey hex>/update-health.
+type HealthChangeRequest struct {
+	Subsys string // a health.Subsystem value in string form
+	Error  string // or empty if cleared
+}
 
 // SSHPolicy is the policy for how to handle incoming SSH connections
 // over Tailscale.
@@ -1670,6 +2038,10 @@ type SSHAction struct {
 	// AllowLocalPortForwarding, if true, allows accepted connections
 	// to use local port forwarding if requested.
 	AllowLocalPortForwarding bool `json:"allowLocalPortForwarding,omitempty"`
+
+	// Recorders defines the destinations of the SSH session recorders.
+	// The recording will be uploaded to http://addr:port/record.
+	Recorders []netip.AddrPort `json:"recorders"`
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>
@@ -1679,7 +2051,7 @@ type SSHAction struct {
 //
 // The "OverTLS" prefix is to loudly declare that this exchange
 // doesn't happen over Noise and can be intercepted/MITM'ed by
-// enterprise/corp proxies where the orgnanization can put TLS roots
+// enterprise/corp proxies where the organization can put TLS roots
 // on devices.
 type OverTLSPublicKeyResponse struct {
 	// LegacyPublic specifies the control plane server's original
@@ -1747,9 +2119,36 @@ type PeerChange struct {
 	// region ID is now this number.
 	DERPRegion int `json:",omitempty"`
 
+	// Cap, if non-zero, means that NodeID's capability version has changed.
+	Cap CapabilityVersion `json:",omitempty"`
+
 	// Endpoints, if non-empty, means that NodeID's UDP Endpoints
 	// have changed to these.
 	Endpoints []string `json:",omitempty"`
+
+	// Key, if non-nil, means that the NodeID's wireguard public key changed.
+	Key *key.NodePublic `json:",omitempty"`
+
+	// KeySignature, if non-nil, means that the signature of the wireguard
+	// public key has changed.
+	KeySignature tkatype.MarshaledSignature `json:",omitempty"`
+
+	// DiscoKey, if non-nil, means that the NodeID's discokey changed.
+	DiscoKey *key.DiscoPublic `json:",omitempty"`
+
+	// Online, if non-nil, means that the NodeID's online status changed.
+	Online *bool `json:",omitempty"`
+
+	// LastSeen, if non-nil, means that the NodeID's online status changed.
+	LastSeen *time.Time `json:",omitempty"`
+
+	// KeyExpiry, if non-nil, changes the NodeID's key expiry.
+	KeyExpiry *time.Time `json:",omitempty"`
+
+	// Capabilities, if non-nil, means that the NodeID's capabilities changed.
+	// It's a pointer to a slice for "omitempty", to allow differentiating
+	// a change to empty from no change.
+	Capabilities *[]string `json:",omitempty"`
 }
 
 // DerpMagicIP is a fake WireGuard endpoint IP address that means to
@@ -1758,3 +2157,15 @@ type PeerChange struct {
 //
 // Mnemonic: 3.3.40 are numbers above the keys D, E, R, P.
 const DerpMagicIP = "127.3.3.40"
+
+// EarlyNoise is the early payload that's sent over Noise but before the HTTP/2
+// handshake when connecting to the coordination server.
+//
+// This exists to let the server push some early info to client for that
+// stateful HTTP/2+Noise connection without incurring an extra round trip. (This
+// would've used HTTP/2 server push, had Go's client-side APIs been available)
+type EarlyNoise struct {
+	// NodeKeyChallenge is a random per-connection public key to be used by
+	// the client to prove possession of a wireguard private key.
+	NodeKeyChallenge key.ChallengePublic `json:"nodeKeyChallenge"`
+}

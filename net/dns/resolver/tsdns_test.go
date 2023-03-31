@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -11,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -350,6 +350,18 @@ func TestResolveLocal(t *testing.T) {
 		{"x_via_dec", dnsname.FQDN("1.0.0.10.via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.0.0.10"), dns.RCodeSuccess},
 		{"via_invalid", dnsname.FQDN("via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 		{"via_invalid_2", dnsname.FQDN("2.3.4.5.via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+
+		// Hyphenated 4via6 format.
+		// Without any suffix domain:
+		{"via_form3_hex_bare", dnsname.FQDN("1-2-3-4-via-0xff."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_bare", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// With a Tailscale domain:
+		{"via_form3_dec_ts.net", dnsname.FQDN("1-2-3-4-via-1.foo.ts.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_tailscale.net", dnsname.FQDN("1-2-3-4-via-1.foo.tailscale.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// Non-Tailscale domain suffixes aren't allowed for now: (the allowed
+		// suffixes are currently hard-coded and not plumbed via the netmap)
+		{"via_form3_dec_example.com", dnsname.FQDN("1-2-3-4-via-1.example.com."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+		{"via_form3_dec_examplets.net", dnsname.FQDN("1-2-3-4-via-1.examplets.net."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -985,11 +997,8 @@ func TestMarshalResponseFormatError(t *testing.T) {
 }
 
 func TestForwardLinkSelection(t *testing.T) {
-	old := initListenConfig
-	defer func() { initListenConfig = old }()
-
 	configCall := make(chan string, 1)
-	initListenConfig = func(nc *net.ListenConfig, mon *monitor.Mon, tunName string) error {
+	tstest.Replace(t, &initListenConfig, func(nc *net.ListenConfig, mon *monitor.Mon, tunName string) error {
 		select {
 		case configCall <- tunName:
 			return nil
@@ -997,7 +1006,7 @@ func TestForwardLinkSelection(t *testing.T) {
 			t.Error("buffer full")
 			return errors.New("buffer full")
 		}
-	}
+	})
 
 	// specialIP is some IP we pretend that our link selector
 	// routes differently.
@@ -1111,7 +1120,7 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	t.Run("no_such_host", func(t *testing.T) {
-		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
+		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
 			Header: dnsmessage.Header{
 				ID:       123,
 				Response: true,
@@ -1222,7 +1231,7 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%v_%v", tt.Type, strings.Trim(tt.Name, ".")), func(t *testing.T) {
-			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
+			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
 				Header: dnsmessage.Header{
 					ID:       123,
 					Response: true,
@@ -1384,7 +1393,7 @@ func (a *wrapResolverConn) WriteTo(q []byte, _ net.Addr) (n int, err error) {
 	if resp == nil {
 		return 0, errors.New("bad query")
 	}
-	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), a.r, resp)
+	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), log.Printf, a.r, resp)
 	if err != nil {
 		return 0, err
 	}

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package filter
 
@@ -97,15 +96,15 @@ func MatchesFromFilterRules(pf []tailcfg.FilterRule) ([]Match, error) {
 
 var (
 	zeroIP4 = netaddr.IPv4(0, 0, 0, 0)
-	zeroIP6 = netaddr.IPFrom16([16]byte{})
+	zeroIP6 = netip.AddrFrom16([16]byte{})
 )
 
 // parseIPSet parses arg as one:
 //
-//     * an IP address (IPv4 or IPv6)
-//     * the string "*" to match everything (both IPv4 & IPv6)
-//     * a CIDR (e.g. "192.168.0.0/16")
-//     * a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
+//   - an IP address (IPv4 or IPv6)
+//   - the string "*" to match everything (both IPv4 & IPv6)
+//   - a CIDR (e.g. "192.168.0.0/16")
+//   - a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
 //
 // bits, if non-nil, is the legacy SrcBits CIDR length to make a IP
 // address (without a slash) treated as a CIDR of *bits length.

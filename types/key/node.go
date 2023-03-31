@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -10,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"go4.org/mem"
 	"golang.org/x/crypto/curve25519"
@@ -33,6 +33,10 @@ const (
 	// This prefix is used in the control protocol, so cannot be
 	// changed.
 	nodePublicHexPrefix = "nodekey:"
+
+	// nodePublicBinaryPrefix is the prefix used to identify a
+	// binary-encoded node public key.
+	nodePublicBinaryPrefix = "np"
 
 	// NodePublicRawLen is the length in bytes of a NodePublic, when
 	// serialized with AppendTo, Raw32 or WriteRawWithoutAllocating.
@@ -188,6 +192,23 @@ func NodePublicFromRaw32(raw mem.RO) NodePublic {
 	return ret
 }
 
+// badOldPrefix is a nodekey/discokey prefix that, when base64'd, serializes
+// with a "bad01" ("bad ol'", ~"bad old") prefix. It's used for expired node
+// keys so when we debug a customer issue, the "bad01" can jump out to us. See:
+//
+//	https://github.com/tailscale/tailscale/issues/6932
+var badOldPrefix = []byte{109, 167, 116, 213, 215, 116}
+
+// NodePublicWithBadOldPrefix returns a copy of k with its leading public key
+// bytes mutated such that it base64's to a ShortString of [bad01] ("bad ol'"
+// [expired node key]).
+func NodePublicWithBadOldPrefix(k NodePublic) NodePublic {
+	var buf [32]byte
+	k.AppendTo(buf[:0])
+	copy(buf[:], badOldPrefix)
+	return NodePublicFromRaw32(mem.B(buf[:]))
+}
+
 // IsZero reports whether k is the zero value.
 func (k NodePublic) IsZero() bool {
 	return k == NodePublic{}
@@ -295,6 +316,28 @@ func (k NodePublic) MarshalText() ([]byte, error) {
 // MarshalText implements encoding.TextUnmarshaler.
 func (k *NodePublic) UnmarshalText(b []byte) error {
 	return parseHex(k.k[:], mem.B(b), mem.S(nodePublicHexPrefix))
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler.
+func (k NodePublic) MarshalBinary() (data []byte, err error) {
+	b := make([]byte, len(nodePublicBinaryPrefix)+NodePublicRawLen)
+	copy(b[:len(nodePublicBinaryPrefix)], nodePublicBinaryPrefix)
+	copy(b[len(nodePublicBinaryPrefix):], k.k[:])
+	return b, nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+func (k *NodePublic) UnmarshalBinary(in []byte) error {
+	data := mem.B(in)
+	if !mem.HasPrefix(data, mem.S(nodePublicBinaryPrefix)) {
+		return fmt.Errorf("missing/incorrect type prefix %s", nodePublicBinaryPrefix)
+	}
+	if want, got := len(nodePublicBinaryPrefix)+NodePublicRawLen, data.Len(); want != got {
+		return fmt.Errorf("incorrect len for NodePublic (%d != %d)", got, want)
+	}
+
+	data.SliceFrom(len(nodePublicBinaryPrefix)).Copy(k.k[:])
+	return nil
 }
 
 // WireGuardGoString prints k in the same format used by wireguard-go.

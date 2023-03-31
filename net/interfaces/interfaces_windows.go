@@ -1,12 +1,10 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package interfaces
 
 import (
 	"log"
-	"net"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -15,7 +13,6 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"tailscale.com/net/netaddr"
 	"tailscale.com/tsconst"
 )
 
@@ -55,18 +52,18 @@ func likelyHomeRouterIPWindows() (ret netip.Addr, ok bool) {
 		return
 	}
 
-	unspec := net.IPv4(0, 0, 0, 0)
+	v4unspec := netip.IPv4Unspecified()
 	var best *winipcfg.MibIPforwardRow2 // best (lowest metric) found so far, or nil
 
 	for i := range rs {
 		r := &rs[i]
-		if r.Loopback || r.DestinationPrefix.PrefixLength != 0 || !r.DestinationPrefix.Prefix.IP().Equal(unspec) {
+		if r.Loopback || r.DestinationPrefix.PrefixLength != 0 || r.DestinationPrefix.Prefix().Addr().Unmap() != v4unspec {
 			// Not a default route, so skip
 			continue
 		}
 
-		ip, ok := netaddr.FromStdIP(r.NextHop.IP())
-		if !ok {
+		ip := r.NextHop.Addr().Unmap()
+		if !ip.IsValid() {
 			// Not a valid gateway, so skip (won't happen though)
 			continue
 		}

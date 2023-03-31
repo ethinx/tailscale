@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derp
 
@@ -13,11 +12,11 @@ import (
 	"io"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go4.org/mem"
 	"golang.org/x/time/rate"
+	"tailscale.com/syncs"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -39,8 +38,8 @@ type Client struct {
 	rate *rate.Limiter // if non-nil, rate limiter to use
 
 	// Owned by Recv:
-	peeked  int          // bytes to discard on next Recv
-	readErr atomic.Value // of error; sticky (set by Recv)
+	peeked  int                      // bytes to discard on next Recv
+	readErr syncs.AtomicValue[error] // sticky (set by Recv)
 }
 
 // ClientOpt is an option passed to NewClient.
@@ -349,9 +348,12 @@ type ReceivedPacket struct {
 func (ReceivedPacket) msg() {}
 
 // PeerGoneMessage is a ReceivedMessage that indicates that the client
-// identified by the underlying public key had previously sent you a
-// packet but has now disconnected from the server.
-type PeerGoneMessage key.NodePublic
+// identified by the underlying public key is not connected to this
+// server.
+type PeerGoneMessage struct {
+	Peer   key.NodePublic
+	Reason PeerGoneReasonType
+}
 
 func (PeerGoneMessage) msg() {}
 
@@ -445,7 +447,7 @@ func (c *Client) Recv() (m ReceivedMessage, err error) {
 }
 
 func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err error) {
-	readErr, _ := c.readErr.Load().(error)
+	readErr := c.readErr.Load()
 	if readErr != nil {
 		return nil, readErr
 	}
@@ -525,7 +527,15 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 				c.logf("[unexpected] dropping short peerGone frame from DERP server")
 				continue
 			}
-			pg := PeerGoneMessage(key.NodePublicFromRaw32(mem.B(b[:keyLen])))
+			// Backward compatibility for the older peerGone without reason byte
+			reason := PeerGoneReasonDisconnected
+			if n > keyLen {
+				reason = PeerGoneReasonType(b[keyLen])
+			}
+			pg := PeerGoneMessage{
+				Peer:   key.NodePublicFromRaw32(mem.B(b[:keyLen])),
+				Reason: reason,
+			}
 			return pg, nil
 
 		case framePeerPresent:

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsdial provides a Dialer type that can dial out of tailscaled.
 package tsdial
@@ -15,13 +14,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/interfaces"
-	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
@@ -44,8 +41,6 @@ type Dialer struct {
 	// If nil, it's not used.
 	NetstackDialTCP func(context.Context, netip.AddrPort) (net.Conn, error)
 
-	peerDialControlFuncAtomic atomic.Value // of func() func(network, address string, c syscall.RawConn) error
-
 	peerClientOnce sync.Once
 	peerClient     *http.Client
 
@@ -62,7 +57,7 @@ type Dialer struct {
 	linkMon           *monitor.Mon
 	linkMonUnregister func()
 	exitDNSDoHBase    string                 // non-empty if DoH-proxying exit node in use; base URL+path (without '?')
-	dnsCache          *dnscache.MessageCache // nil until first first non-empty SetExitDNSDoH
+	dnsCache          *dnscache.MessageCache // nil until first non-empty SetExitDNSDoH
 	nextSysConnID     int
 	activeSysConns    map[int]net.Conn // active connections not yet closed
 }
@@ -214,7 +209,7 @@ func (d *Dialer) userDialResolve(ctx context.Context, network, addr string) (net
 	exitDNSDoH := d.exitDNSDoHBase
 	d.mu.Unlock()
 
-	// MagicDNS or otherwise baked in to the NetworkMap? Try that first.
+	// MagicDNS or otherwise baked into the NetworkMap? Try that first.
 	ipp, err := dns.resolveMemory(ctx, network, addr)
 	if err != errUnresolved {
 		return ipp, err
@@ -250,8 +245,8 @@ func (d *Dialer) userDialResolve(ctx context.Context, network, addr string) (net
 	if len(ips) == 0 {
 		return netip.AddrPort{}, fmt.Errorf("DNS lookup returned no results for %q", host)
 	}
-	ip, _ := netaddr.FromStdIP(ips[0])
-	return netip.AddrPortFrom(ip, port), nil
+	ip, _ := netip.AddrFromSlice(ips[0])
+	return netip.AddrPortFrom(ip.Unmap(), port), nil
 }
 
 // ipNetOfNetwork returns "ip", "ip4", or "ip6" corresponding
@@ -345,7 +340,7 @@ func (d *Dialer) dialPeerAPI(ctx context.Context, network, addr string) (net.Con
 }
 
 // getPeerDialer returns the *net.Dialer to use to dial peers to use
-// peer API.
+// PeerAPI.
 //
 // This is not used in netstack mode.
 //

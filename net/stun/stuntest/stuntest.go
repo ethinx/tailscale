@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package stuntest provides a STUN test server.
 package stuntest
@@ -84,7 +83,8 @@ func runSTUN(t testing.TB, pc net.PacketConn, stats *stunStats, done chan<- stru
 		}
 		stats.mu.Unlock()
 
-		res := stun.Response(txid, ua.IP, uint16(ua.Port))
+		nia, _ := netip.AddrFromSlice(ua.IP)
+		res := stun.Response(txid, netip.AddrPortFrom(nia, uint16(ua.Port)))
 		if _, err := pc.WriteTo(res, addr); err != nil {
 			t.Logf("STUN server write failed: %v", err)
 		}
@@ -121,7 +121,7 @@ func DERPMapOf(stun ...string) *tailcfg.DERPMap {
 		node := &tailcfg.DERPNode{
 			Name:     fmt.Sprint(regionID) + "a",
 			RegionID: regionID,
-			HostName: fmt.Sprintf("d%d.invalid", regionID),
+			HostName: fmt.Sprintf("d%d%s", regionID, tailcfg.DotInvalid),
 			IPv4:     ipv4,
 			IPv6:     ipv6,
 			STUNPort: port,

@@ -1,10 +1,10 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -20,6 +20,19 @@ import (
 )
 
 const testGPRuleID = "{7B1B6151-84E6-41A3-8967-62F7F7B45687}"
+
+func TestHostFileNewLines(t *testing.T) {
+	in := []byte("#foo\r\n#bar\n#baz\n")
+	want := []byte("#foo\r\n#bar\r\n#baz\r\n")
+
+	got, err := setTailscaleHosts(in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q\n", got, want)
+	}
+}
 
 func TestManagerWindowsLocal(t *testing.T) {
 	if !isWindows10OrBetter() || !winutil.IsCurrentProcessElevated() {
@@ -75,7 +88,7 @@ func TestManagerWindowsGPMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOSConfigurator: %v\n", err)
 	}
-	mgr := cfg.(windowsManager)
+	mgr := cfg.(*windowsManager)
 	defer mgr.Close()
 
 	usingGP := mgr.nrptDB.writeAsGP
@@ -204,7 +217,7 @@ func runTest(t *testing.T, isLocal bool) {
 	if err != nil {
 		t.Fatalf("NewOSConfigurator: %v\n", err)
 	}
-	mgr := cfg.(windowsManager)
+	mgr := cfg.(*windowsManager)
 	defer mgr.Close()
 
 	usingGP := mgr.nrptDB.writeAsGP
@@ -260,7 +273,7 @@ func runTest(t *testing.T, isLocal bool) {
 	runCase := func(n int) {
 		t.Logf("Test case: %d domains\n", n)
 		if !isLocal {
-			// When !isLocal, we want to check that a GP notification occured for
+			// When !isLocal, we want to check that a GP notification occurred for
 			// every single test case.
 			trk, err = newGPNotificationTracker()
 			if err != nil {
@@ -339,11 +352,12 @@ func deleteFakeGPKey(t *testing.T) {
 }
 
 func createFakeInterfaceKey(t *testing.T, guid windows.GUID) (func(), error) {
-	basePaths := []string{ipv4RegBase, ipv6RegBase}
+	basePaths := []winutil.RegistryPathPrefix{winutil.IPv4TCPIPInterfacePrefix, winutil.IPv6TCPIPInterfacePrefix}
 	keyPaths := make([]string, 0, len(basePaths))
 
+	guidStr := guid.String()
 	for _, basePath := range basePaths {
-		keyPath := fmt.Sprintf(`%s\Interfaces\%s`, basePath, guid)
+		keyPath := string(basePath.WithSuffix(guidStr))
 		key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, keyPath, registry.SET_VALUE)
 		if err != nil {
 			return nil, err

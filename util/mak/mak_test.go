@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package mak contains code to help make things.
 package mak
@@ -67,5 +66,23 @@ func TestNonNil(t *testing.T) {
 	}
 	if m == nil {
 		t.Error("map still nil")
+	}
+}
+
+func TestNonNilMapForJSON(t *testing.T) {
+	type M map[string]int
+	var m M
+	NonNilMapForJSON(&m)
+	if m == nil {
+		t.Fatal("still nil")
+	}
+}
+
+func TestNonNilSliceForJSON(t *testing.T) {
+	type S []int
+	var s S
+	NonNilSliceForJSON(&s)
+	if s == nil {
+		t.Fatal("still nil")
 	}
 }

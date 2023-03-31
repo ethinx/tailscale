@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsaddr handles Tailscale-specific IPs and ranges.
 package tsaddr
@@ -11,6 +10,7 @@ import (
 	"net/netip"
 	"sync"
 
+	"golang.org/x/exp/slices"
 	"tailscale.com/net/netaddr"
 )
 
@@ -26,7 +26,7 @@ var chromeOSRange oncePrefix
 
 // CGNATRange returns the Carrier Grade NAT address range that
 // is the superset range that Tailscale assigns out of.
-// See https://tailscale.com/kb/1015/100.x-addresses.
+// See https://tailscale.com/s/cgnat
 // Note that Tailscale does not assign out of the ChromeOSVMRange.
 func CGNATRange() netip.Prefix {
 	cgnatRange.Do(func() { mustPrefix(&cgnatRange.v, "100.64.0.0/10") })
@@ -56,9 +56,14 @@ func TailscaleServiceIP() netip.Addr {
 //
 // For IPv4, use TailscaleServiceIP.
 func TailscaleServiceIPv6() netip.Addr {
-	serviceIPv6.Do(func() { mustPrefix(&serviceIPv6.v, "fd7a:115c:a1e0::53/128") })
+	serviceIPv6.Do(func() { mustPrefix(&serviceIPv6.v, TailscaleServiceIPv6String+"/128") })
 	return serviceIPv6.v.Addr()
 }
+
+const (
+	TailscaleServiceIPString   = "100.100.100.100"
+	TailscaleServiceIPv6String = "fd7a:115c:a1e0::53"
+)
 
 // IsTailscaleIP reports whether ip is an IP address in a range that
 // Tailscale assigns from.
@@ -126,7 +131,7 @@ func Tailscale4To6(ipv4 netip.Addr) netip.Addr {
 	ret := Tailscale4To6Range().Addr().As16()
 	v4 := ipv4.As4()
 	copy(ret[13:], v4[1:])
-	return netaddr.IPFrom16(ret)
+	return netip.AddrFrom16(ret)
 }
 
 // Tailscale6to4 returns the IPv4 address corresponding to the given
@@ -138,7 +143,7 @@ func Tailscale6to4(ipv6 netip.Addr) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 	v6 := ipv6.As16()
-	return netaddr.IPv4(100, v6[13], v6[14], v6[15]), true
+	return netip.AddrFrom4([4]byte{100, v6[13], v6[14], v6[15]}), true
 }
 
 func mustPrefix(v *netip.Prefix, prefix string) {
@@ -201,31 +206,10 @@ func NewContainsIPFunc(addrs []netip.Prefix) func(ip netip.Addr) bool {
 	return func(ip netip.Addr) bool { return m[ip] }
 }
 
-// PrefixesContainsFunc reports whether f is true for any IPPrefix in
-// ipp.
-func PrefixesContainsFunc(ipp []netip.Prefix, f func(netip.Prefix) bool) bool {
-	for _, v := range ipp {
-		if f(v) {
-			return true
-		}
-	}
-	return false
-}
-
 // PrefixesContainsIP reports whether any prefix in ipp contains ip.
 func PrefixesContainsIP(ipp []netip.Prefix, ip netip.Addr) bool {
 	for _, r := range ipp {
 		if r.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// IPsContainsFunc reports whether f is true for any IP in ips.
-func IPsContainsFunc(ips []netip.Addr, f func(netip.Addr) bool) bool {
-	for _, v := range ips {
-		if f(v) {
 			return true
 		}
 	}
@@ -265,6 +249,16 @@ func AllIPv6() netip.Prefix { return allIPv6 }
 
 // ExitRoutes returns a slice containing AllIPv4 and AllIPv6.
 func ExitRoutes() []netip.Prefix { return []netip.Prefix{allIPv4, allIPv6} }
+
+// SortPrefixes sorts the prefixes in place.
+func SortPrefixes(p []netip.Prefix) {
+	slices.SortFunc(p, func(ri, rj netip.Prefix) bool {
+		if ri.Addr() == rj.Addr() {
+			return ri.Bits() < rj.Bits()
+		}
+		return ri.Addr().Less(rj.Addr())
+	})
+}
 
 // FilterPrefixes returns a new slice, not aliasing in, containing elements of
 // in that match f.
@@ -307,5 +301,5 @@ func MapVia(siteID uint32, v4 netip.Prefix) (via netip.Prefix, err error) {
 	binary.BigEndian.PutUint32(a[8:], siteID)
 	ip4a := v4.Addr().As4()
 	copy(a[12:], ip4a[:])
-	return netip.PrefixFrom(netaddr.IPFrom16(a), v4.Bits()+64+32), nil
+	return netip.PrefixFrom(netip.AddrFrom16(a), v4.Bits()+64+32), nil
 }

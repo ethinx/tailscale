@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
 
@@ -57,23 +56,25 @@ func main() {
 			return
 		}
 
-		if len(info.Node.Tags) != 0 {
+		if info.Node.IsTagged() {
 			w.WriteHeader(http.StatusForbidden)
 			log.Printf("node %s is tagged", info.Node.Hostinfo.Hostname())
 			return
 		}
 
-		_, tailnet, ok := strings.Cut(info.Node.Name, info.Node.ComputedName+".")
-		if !ok {
-			w.WriteHeader(http.StatusUnauthorized)
-			log.Printf("can't extract tailnet name from hostname %q", info.Node.Name)
-			return
-		}
-		tailnet, _, ok = strings.Cut(tailnet, ".beta.tailscale.net")
-		if !ok {
-			w.WriteHeader(http.StatusUnauthorized)
-			log.Printf("can't extract tailnet name from hostname %q", info.Node.Name)
-			return
+		// tailnet of connected node. When accessing shared nodes, this
+		// will be empty because the tailnet of the sharee is not exposed.
+		var tailnet string
+
+		if !info.Node.Hostinfo.ShareeNode() {
+			var ok bool
+			_, tailnet, ok = strings.Cut(info.Node.Name, info.Node.ComputedName+".")
+			if !ok {
+				w.WriteHeader(http.StatusUnauthorized)
+				log.Printf("can't extract tailnet name from hostname %q", info.Node.Name)
+				return
+			}
+			tailnet = strings.TrimSuffix(tailnet, ".beta.tailscale.net")
 		}
 
 		if expectedTailnet := r.Header.Get("Expected-Tailnet"); expectedTailnet != "" && expectedTailnet != tailnet {

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -24,8 +23,8 @@ func init() {
 		} else if n > 10000 {
 			n = 10000
 		}
-		fl, ok := fwdLogAtomic.Load().(*fwdLog)
-		if !ok || n != len(fl.ent) {
+		fl := fwdLogAtomic.Load()
+		if fl == nil || n != len(fl.ent) {
 			fl = &fwdLog{ent: make([]fwdLogEntry, n)}
 			fwdLogAtomic.Store(fl)
 		}
@@ -33,7 +32,7 @@ func init() {
 	}))
 }
 
-var fwdLogAtomic atomic.Value // of *fwdLog
+var fwdLogAtomic atomic.Pointer[fwdLog]
 
 type fwdLog struct {
 	mu  sync.Mutex

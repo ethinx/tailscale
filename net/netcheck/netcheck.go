@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netcheck checks the network conditions from the current host.
 package netcheck
@@ -12,13 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +29,9 @@ import (
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/ping"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -37,11 +39,12 @@ import (
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 )
 
 // Debugging and experimentation tweakables.
 var (
-	debugNetcheck = envknob.Bool("TS_DEBUG_NETCHECK")
+	debugNetcheck = envknob.RegisterBool("TS_DEBUG_NETCHECK")
 )
 
 // The various default timeouts for things.
@@ -54,6 +57,9 @@ const (
 	// switching to HTTP probing, on the assumption that outbound UDP
 	// is blocked.
 	stunProbeTimeout = 3 * time.Second
+	// icmpProbeTimeout is the maximum amount of time netcheck will spend
+	// probing with ICMP packets.
+	icmpProbeTimeout = 1 * time.Second
 	// hairpinCheckTimeout is the amount of time we wait for a
 	// hairpinned packet to come back.
 	hairpinCheckTimeout = 100 * time.Millisecond
@@ -79,6 +85,7 @@ type Report struct {
 	IPv6CanSend bool // an IPv6 packet was able to be sent
 	IPv4CanSend bool // an IPv4 packet was able to be sent
 	OSHasIPv6   bool // could bind a socket to ::1
+	ICMPv4      bool // an ICMPv4 round trip completed
 
 	// MappingVariesByDestIP is whether STUN results depend which
 	// STUN server you're talking to (on IPv4).
@@ -106,6 +113,10 @@ type Report struct {
 
 	GlobalV4 string // ip:port of global IPv4
 	GlobalV6 string // [ip]:port of global IPv6
+
+	// CaptivePortal is set when we think there's a captive portal that is
+	// intercepting HTTP traffic.
+	CaptivePortal opt.Bool
 
 	// TODO: update Clone when adding new fields
 }
@@ -151,7 +162,7 @@ type Client struct {
 
 	// GetSTUNConn4 optionally provides a func to return the
 	// connection to use for sending & receiving IPv4 packets. If
-	// nil, an emphemeral one is created as needed.
+	// nil, an ephemeral one is created as needed.
 	GetSTUNConn4 func() STUNConn
 
 	// GetSTUNConn6 is like GetSTUNConn4, but for IPv6.
@@ -170,6 +181,10 @@ type Client struct {
 	// If nil, portmap discovery is not done.
 	PortMapper *portmapper.Client // lazily initialized on first use
 
+	// For tests
+	testEnoughRegions      int
+	testCaptivePortalDelay time.Duration
+
 	mu       sync.Mutex            // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
 	prev     map[time.Time]*Report // some previous reports
@@ -187,12 +202,23 @@ type STUNConn interface {
 }
 
 func (c *Client) enoughRegions() int {
+	if c.testEnoughRegions > 0 {
+		return c.testEnoughRegions
+	}
 	if c.Verbose {
 		// Abuse verbose a bit here so netcheck can show all region latencies
 		// in verbose mode.
 		return 100
 	}
 	return 3
+}
+
+func (c *Client) captivePortalDelay() time.Duration {
+	if c.testCaptivePortalDelay > 0 {
+		return c.testCaptivePortalDelay
+	}
+	// Chosen semi-arbitrarily
+	return 200 * time.Millisecond
 }
 
 func (c *Client) logf(format string, a ...any) {
@@ -204,7 +230,7 @@ func (c *Client) logf(format string, a ...any) {
 }
 
 func (c *Client) vlogf(format string, a ...any) {
-	if c.Verbose || debugNetcheck {
+	if c.Verbose || debugNetcheck() {
 		c.logf(format, a...)
 	}
 }
@@ -255,7 +281,7 @@ func (c *Client) ReceiveSTUNPacket(pkt []byte, src netip.AddrPort) {
 		return
 	}
 
-	tx, addr, port, err := stun.ParseResponse(pkt)
+	tx, addrPort, err := stun.ParseResponse(pkt)
 	if err != nil {
 		if _, err := stun.ParseBindingRequest(pkt); err == nil {
 			// This was probably our own netcheck hairpin
@@ -273,9 +299,7 @@ func (c *Client) ReceiveSTUNPacket(pkt []byte, src netip.AddrPort) {
 	}
 	rs.mu.Unlock()
 	if ok {
-		if ipp, ok := netaddr.FromStdAddr(addr, int(port), ""); ok {
-			onDone(ipp)
-		}
+		onDone(addrPort)
 	}
 }
 
@@ -516,8 +540,8 @@ func (c *Client) readPackets(ctx context.Context, pc net.PacketConn) {
 		if !stun.Is(pkt) {
 			continue
 		}
-		if ipp, ok := netaddr.FromStdAddr(ua.IP, ua.Port, ua.Zone); ok {
-			c.ReceiveSTUNPacket(pkt, ipp)
+		if ap := netaddr.Unmap(ua.AddrPort()); ap.IsValid() {
+			c.ReceiveSTUNPacket(pkt, ap)
 		}
 	}
 }
@@ -614,20 +638,23 @@ func (rs *reportState) waitHairCheck(ctx context.Context) {
 		return
 	}
 
+	// First, check whether we have a value before we check for timeouts.
+	select {
+	case <-rs.gotHairSTUN:
+		ret.HairPinning.Set(true)
+		return
+	default:
+	}
+
+	// Now, wait for a response or a timeout.
 	select {
 	case <-rs.gotHairSTUN:
 		ret.HairPinning.Set(true)
 	case <-rs.hairTimeout:
 		rs.c.vlogf("hairCheck timeout")
 		ret.HairPinning.Set(false)
-	default:
-		select {
-		case <-rs.gotHairSTUN:
-			ret.HairPinning.Set(true)
-		case <-rs.hairTimeout:
-			ret.HairPinning.Set(false)
-		case <-ctx.Done():
-		}
+	case <-ctx.Done():
+		rs.c.vlogf("hairCheck context timeout")
 	}
 }
 
@@ -760,6 +787,8 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	ctx, cancel := context.WithTimeout(ctx, overallProbeTimeout)
 	defer cancel()
 
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelNetcheckClient)
+
 	if dm == nil {
 		return nil, errors.New("netcheck: GetReport: DERP map is nil")
 	}
@@ -780,13 +809,35 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	}
 	c.curState = rs
 	last := c.last
+
+	// Even if we're doing a non-incremental update, we may want to try our
+	// preferred DERP region for captive portal detection. Save that, if we
+	// have it.
+	var preferredDERP int
+	if last != nil {
+		preferredDERP = last.PreferredDERP
+	}
+
 	now := c.timeNow()
+
+	doFull := false
 	if c.nextFull || now.Sub(c.lastFull) > 5*time.Minute {
+		doFull = true
+	}
+	// If the last report had a captive portal and reported no UDP access,
+	// it's possible that we didn't get a useful netcheck due to the
+	// captive portal blocking us. If so, make this report a full
+	// (non-incremental) one.
+	if !doFull && last != nil {
+		doFull = !last.UDP && last.CaptivePortal.EqualBool(true)
+	}
+	if doFull {
 		last = nil // causes makeProbePlan below to do a full (initial) plan
 		c.nextFull = false
 		c.lastFull = now
 		metricNumGetReportFull.Add(1)
 	}
+
 	rs.incremental = last != nil
 	c.mu.Unlock()
 
@@ -871,6 +922,48 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 
 	plan := makeProbePlan(dm, ifState, last)
 
+	// If we're doing a full probe, also check for a captive portal. We
+	// delay by a bit to wait for UDP STUN to finish, to avoid the probe if
+	// it's unnecessary.
+	captivePortalDone := syncs.ClosedChan()
+	captivePortalStop := func() {}
+	if !rs.incremental {
+		// NOTE(andrew): we can't simply add this goroutine to the
+		// `NewWaitGroupChan` below, since we don't wait for that
+		// waitgroup to finish when exiting this function and thus get
+		// a data race.
+		ch := make(chan struct{})
+		captivePortalDone = ch
+
+		tmr := time.AfterFunc(c.captivePortalDelay(), func() {
+			defer close(ch)
+			found, err := c.checkCaptivePortal(ctx, dm, preferredDERP)
+			if err != nil {
+				c.logf("[v1] checkCaptivePortal: %v", err)
+				return
+			}
+			rs.report.CaptivePortal.Set(found)
+		})
+
+		captivePortalStop = func() {
+			// Don't cancel our captive portal check if we're
+			// explicitly doing a verbose netcheck.
+			if c.Verbose {
+				return
+			}
+
+			if tmr.Stop() {
+				// Stopped successfully; need to close the
+				// signal channel ourselves.
+				close(ch)
+				return
+			}
+
+			// Did not stop; do nothing and it'll finish by itself
+			// and close the signal channel.
+		}
+	}
+
 	wg := syncs.NewWaitGroupChan()
 	wg.Add(len(plan))
 	for _, probeSet := range plan {
@@ -891,9 +984,17 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	case <-stunTimer.C:
 	case <-ctx.Done():
 	case <-wg.DoneChan():
+		// All of our probes finished, so if we have >0 responses, we
+		// stop our captive portal check.
+		if rs.anyUDP() {
+			captivePortalStop()
+		}
 	case <-rs.stopProbeCh:
 		// Saw enough regions.
 		c.vlogf("saw enough regions; not waiting for rest")
+		// We can stop the captive portal check since we know that we
+		// got a bunch of STUN responses.
+		captivePortalStop()
 	}
 
 	rs.waitHairCheck(ctx)
@@ -904,7 +1005,8 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 	}
 	rs.stopTimers()
 
-	// Try HTTPS latency check if all STUN probes failed due to UDP presumably being blocked.
+	// Try HTTPS and ICMP latency check if all STUN probes failed due to
+	// UDP presumably being blocked.
 	// TODO: this should be moved into the probePlan, using probeProto probeHTTPS.
 	if !rs.anyUDP() && ctx.Err() == nil {
 		var wg sync.WaitGroup
@@ -915,6 +1017,19 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 			}
 		}
 		if len(need) > 0 {
+			// Kick off ICMP in parallel to HTTPS checks; we don't
+			// reuse the same WaitGroup for those probes because we
+			// need to close the underlying Pinger after a timeout
+			// or when all ICMP probes are done, regardless of
+			// whether the HTTPS probes have finished.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := c.measureAllICMPLatency(ctx, rs, need); err != nil {
+					c.logf("[v1] measureAllICMPLatency: %v", err)
+				}
+			}()
+
 			wg.Add(len(need))
 			c.logf("netcheck: UDP is blocked, trying HTTPS")
 		}
@@ -925,7 +1040,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 					c.logf("[v1] netcheck: measuring HTTPS latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
 				} else {
 					rs.mu.Lock()
-					rs.report.RegionLatency[reg.RegionID] = d
+					if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+						mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
+					} else if l >= d {
+						rs.report.RegionLatency[reg.RegionID] = d
+					}
 					// We set these IPv4 and IPv6 but they're not really used
 					// and we don't necessarily set them both. If UDP is blocked
 					// and both IPv4 and IPv6 are available over TCP, it's basically
@@ -944,6 +1063,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report,
 		wg.Wait()
 	}
 
+	// Wait for captive portal check before finishing the report.
+	<-captivePortalDone
+
 	return c.finishAndStoreReport(rs, dm), nil
 }
 
@@ -956,6 +1078,75 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 	c.logConciseReport(report, dm)
 
 	return report
+}
+
+var noRedirectClient = &http.Client{
+	// No redirects allowed
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+
+	// Remaining fields are the same as the default client.
+	Transport: http.DefaultClient.Transport,
+	Jar:       http.DefaultClient.Jar,
+	Timeout:   http.DefaultClient.Timeout,
+}
+
+// checkCaptivePortal reports whether or not we think the system is behind a
+// captive portal, detected by making a request to a URL that we know should
+// return a "204 No Content" response and checking if that's what we get.
+//
+// The boolean return is whether we think we have a captive portal.
+func (c *Client) checkCaptivePortal(ctx context.Context, dm *tailcfg.DERPMap, preferredDERP int) (bool, error) {
+	defer noRedirectClient.CloseIdleConnections()
+
+	// If we have a preferred DERP region with more than one node, try
+	// that; otherwise, pick a random one not marked as "Avoid".
+	if preferredDERP == 0 || dm.Regions[preferredDERP] == nil ||
+		(preferredDERP != 0 && len(dm.Regions[preferredDERP].Nodes) == 0) {
+		rids := make([]int, 0, len(dm.Regions))
+		for id, reg := range dm.Regions {
+			if reg == nil || reg.Avoid || len(reg.Nodes) == 0 {
+				continue
+			}
+			rids = append(rids, id)
+		}
+		if len(rids) == 0 {
+			return false, nil
+		}
+		preferredDERP = rids[rand.Intn(len(rids))]
+	}
+
+	node := dm.Regions[preferredDERP].Nodes[0]
+
+	if strings.HasSuffix(node.HostName, tailcfg.DotInvalid) {
+		// Don't try to connect to invalid hostnames. This occurred in tests:
+		// https://github.com/tailscale/tailscale/issues/6207
+		// TODO(bradfitz,andrew-d): how to actually handle this nicely?
+		return false, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+node.HostName+"/generate_204", nil)
+	if err != nil {
+		return false, err
+	}
+
+	// Note: the set of valid characters in a challenge and the total
+	// length is limited; see isChallengeChar in cmd/derper for more
+	// details.
+	chal := "ts_" + node.HostName
+	req.Header.Set("X-Tailscale-Challenge", chal)
+	r, err := noRedirectClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer r.Body.Close()
+
+	expectedResponse := "response " + chal
+	validResponse := r.Header.Get("X-Tailscale-Response") == expectedResponse
+
+	c.logf("[v2] checkCaptivePortal url=%q status_code=%d valid_response=%v", req.URL.String(), r.StatusCode, validResponse)
+	return r.StatusCode != 204 || !validResponse, nil
 }
 
 // runHTTPOnlyChecks is the netcheck done by environments that can
@@ -1024,6 +1215,8 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	var ip netip.Addr
 
 	dc := derphttp.NewNetcheckClient(c.logf)
+	defer dc.Close()
+
 	tlsConn, tcpConn, node, err := dc.DialRegionTLS(ctx, reg)
 	if err != nil {
 		return 0, ip, err
@@ -1031,7 +1224,8 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	defer tcpConn.Close()
 
 	if ta, ok := tlsConn.RemoteAddr().(*net.TCPAddr); ok {
-		ip, _ = netaddr.FromStdIP(ta.IP)
+		ip, _ = netip.AddrFromSlice(ta.IP)
+		ip = ip.Unmap()
 	}
 	if ip == (netip.Addr{}) {
 		return 0, ip, fmt.Errorf("no unexpected RemoteAddr %#v", tlsConn.RemoteAddr())
@@ -1073,7 +1267,7 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 		return 0, ip, fmt.Errorf("unexpected status code: %d (%s)", resp.StatusCode, resp.Status)
 	}
 
-	_, err = io.Copy(ioutil.Discard, io.LimitReader(resp.Body, 8<<10))
+	_, err = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 	if err != nil {
 		return 0, ip, err
 	}
@@ -1084,14 +1278,90 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	return result.ServerProcessing, ip, nil
 }
 
+func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, need []*tailcfg.DERPRegion) error {
+	if len(need) == 0 {
+		return nil
+	}
+	ctx, done := context.WithTimeout(ctx, icmpProbeTimeout)
+	defer done()
+
+	p, err := ping.New(ctx, c.logf)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+
+	c.logf("UDP is blocked, trying ICMP")
+
+	var wg sync.WaitGroup
+	wg.Add(len(need))
+	for _, reg := range need {
+		go func(reg *tailcfg.DERPRegion) {
+			defer wg.Done()
+			if d, err := c.measureICMPLatency(ctx, reg, p); err != nil {
+				c.logf("[v1] measuring ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
+			} else {
+				c.logf("[v1] ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, d)
+				rs.mu.Lock()
+				if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+					mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
+				} else if l >= d {
+					rs.report.RegionLatency[reg.RegionID] = d
+				}
+
+				// We only send IPv4 ICMP right now
+				rs.report.IPv4 = true
+				rs.report.ICMPv4 = true
+
+				rs.mu.Unlock()
+			}
+		}(reg)
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func (c *Client) measureICMPLatency(ctx context.Context, reg *tailcfg.DERPRegion, p *ping.Pinger) (time.Duration, error) {
+	if len(reg.Nodes) == 0 {
+		return 0, fmt.Errorf("no nodes for region %d (%v)", reg.RegionID, reg.RegionCode)
+	}
+
+	// Try pinging the first node in the region
+	node := reg.Nodes[0]
+
+	// Get the IPAddr by asking for the UDP address that we would use for
+	// STUN and then using that IP.
+	//
+	// TODO(andrew-d): this is a bit ugly
+	nodeAddr := c.nodeAddr(ctx, node, probeIPv4)
+	if !nodeAddr.IsValid() {
+		return 0, fmt.Errorf("no address for node %v", node.Name)
+	}
+	addr := &net.IPAddr{
+		IP:   net.IP(nodeAddr.Addr().AsSlice()),
+		Zone: nodeAddr.Addr().Zone(),
+	}
+
+	// Use the unique node.Name field as the packet data to reduce the
+	// likelihood that we get a mismatched echo response.
+	return p.Send(ctx, addr, []byte(node.Name))
+}
+
 func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {
 	c.logf("[v1] report: %v", logger.ArgWriter(func(w *bufio.Writer) {
 		fmt.Fprintf(w, "udp=%v", r.UDP)
 		if !r.IPv4 {
 			fmt.Fprintf(w, " v4=%v", r.IPv4)
 		}
+		if !r.UDP {
+			fmt.Fprintf(w, " icmpv4=%v", r.ICMPv4)
+		}
 
 		fmt.Fprintf(w, " v6=%v", r.IPv6)
+		if !r.IPv6 {
+			fmt.Fprintf(w, " v6os=%v", r.OSHasIPv6)
+		}
 		fmt.Fprintf(w, " mapvarydest=%v", r.MappingVariesByDestIP)
 		fmt.Fprintf(w, " hair=%v", r.HairPinning)
 		if r.AnyPortMappingChecked() {
@@ -1104,6 +1374,9 @@ func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {
 		}
 		if r.GlobalV6 != "" {
 			fmt.Fprintf(w, " v6a=%v", r.GlobalV6)
+		}
+		if r.CaptivePortal != "" {
+			fmt.Fprintf(w, " captiveportal=%v", r.CaptivePortal)
 		}
 		fmt.Fprintf(w, " derp=%v", r.PreferredDERP)
 		if r.PreferredDERP != 0 {
@@ -1328,8 +1601,8 @@ func (c *Client) nodeAddr(ctx context.Context, n *tailcfg.DERPNode, proto probeP
 	addrs, _ := net.DefaultResolver.LookupIPAddr(ctx, n.HostName)
 	for _, a := range addrs {
 		if (a.IP.To4() != nil) == (proto == probeIPv4) {
-			na, _ := netaddr.FromStdIP(a.IP.To4())
-			return netip.AddrPortFrom(na, uint16(port))
+			na, _ := netip.AddrFromSlice(a.IP.To4())
+			return netip.AddrPortFrom(na.Unmap(), uint16(port))
 		}
 	}
 	return

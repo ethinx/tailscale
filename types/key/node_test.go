@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -29,6 +28,20 @@ func TestNodeKey(t *testing.T) {
 	}
 	if full, got := string(bs), ":"+p.UntypedHexString(); !strings.HasSuffix(full, got) {
 		t.Fatalf("NodePublic.UntypedHexString is not a suffix of the typed serialization, got %q want suffix of %q", got, full)
+	}
+	bs, err = p.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := bs, append([]byte(nodePublicBinaryPrefix), p.k[:]...); !bytes.Equal(got, want) {
+		t.Fatalf("Binary-encoded NodePublic = %x, want %x", got, want)
+	}
+	var decoded NodePublic
+	if err := decoded.UnmarshalBinary(bs); err != nil {
+		t.Fatalf("NodePublic.UnmarshalBinary(%x) failed: %v", bs, err)
+	}
+	if decoded != p {
+		t.Errorf("unmarshaled and original NodePublic differ:\noriginal = %v\ndecoded = %v", p, decoded)
 	}
 
 	z := NodePublic{}
@@ -126,5 +139,21 @@ func TestNodeWriteRawWithoutAllocating(t *testing.T) {
 	})
 	if want := 0.0; got != want {
 		t.Fatalf("WriteRawWithoutAllocating got %f allocs, want %f", got, want)
+	}
+}
+
+func TestChallenge(t *testing.T) {
+	priv := NewChallenge()
+	pub := priv.Public()
+	txt, err := pub.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ChallengePublic
+	if err := back.UnmarshalText(txt); err != nil {
+		t.Fatal(err)
+	}
+	if back != pub {
+		t.Errorf("didn't round trip: %v != %v", back, pub)
 	}
 }
